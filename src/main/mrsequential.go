@@ -36,7 +36,9 @@ func main() {
 	// accumulate the intermediate Map output.
 	//
 	intermediate := []mr.KeyValue{}
+	log.Printf("Parameters count %v", len(os.Args))
 	for _, filename := range os.Args[2:] {
+		log.Printf("Filename: %v", filename)
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)

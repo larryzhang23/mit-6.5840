@@ -5,8 +5,8 @@
 #
 
 # un-comment this to run the tests with the Go race detector.
-# RACE=-race
-
+RACE=-race
+alias timeout='gtimeout'
 if [[ "$OSTYPE" = "darwin"* ]]
 then
   if go version | grep 'go1.17.[012345]'
