@@ -103,9 +103,9 @@ func CallForTasks(workerId int) (*TaskReply, bool) {
 	// the Example() method of struct Coordinator.
 	ok := call("Coordinator.GetTasks", &args, &reply)
 	if ok {
-		log.Printf("[workerId: %v] call for tasks successful with taskType (%v) nReduce (%v) filename (%v)\n", workerId, reply.TaskType, reply.NReduce, reply.Filename)
+		DPrintf("[workerId: %v] call for tasks successful with taskType (%v) nReduce (%v) filename (%v)\n", workerId, reply.TaskType, reply.NReduce, reply.Filename)
 	} else {
-		log.Printf("[workerId: %v] call for tasks failed with taskType (%v) nReduce (%v) filename (%v)\n", workerId, reply.TaskType, reply.NReduce, reply.Filename)
+		DPrintf("[workerId: %v] call for tasks failed with taskType (%v) nReduce (%v) filename (%v)\n", workerId, reply.TaskType, reply.NReduce, reply.Filename)
 	}
 	return &reply, ok	
 }
@@ -122,9 +122,9 @@ func CallBack(workerId int, taskReply *TaskReply) bool {
 
 	ok := call("Coordinator.SetTaskDone", &args, &reply)
 	if ok {
-		log.Printf("[workerId: %v] call back successful with taskType %v\n", workerId, taskType)
+		DPrintf("[workerId: %v] call back successful with taskType %v\n", workerId, taskType)
 	} else {
-		log.Printf("[workerId: %v] call back failed with taskType %v, doing necessary file cleaning now!\n", workerId, taskType)
+		DPrintf("[workerId: %v] call back failed with taskType %v, doing necessary file cleaning now!\n", workerId, taskType)
 		if taskType == "map" {
 			filename := taskReply.Filename[0]
 			_, filenameBase := getDirFilename(filename)
@@ -176,7 +176,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	log.Println(err)
+	// log.Println(err)
+	DPrintf("%v\n", err)
 	return false
 }
 
@@ -240,7 +241,7 @@ func runReduceTask(reducef func(string, []string) string,  taskDef *TaskReply, w
 	// read partisions and group keys together
 	kva := make(map[string][]string)
 	for _, filename := range taskDef.Filename {
-		// log.Printf("Catch file %v\n", filename)
+
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
@@ -259,7 +260,7 @@ func runReduceTask(reducef func(string, []string) string,  taskDef *TaskReply, w
 		file.Close()
 	}
 	if len(kva) == 0 {
-		log.Printf("[workerId %v]: zero mapping content for %v", workerId, taskDef.Filename)
+		DPrintf("[workerId %v]: zero mapping content for %v", workerId, taskDef.Filename)
 	}
 	
 	// filename example: mr_out_0_saddhajskhda

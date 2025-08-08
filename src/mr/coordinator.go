@@ -53,7 +53,7 @@ func (c *Coordinator) GetTasks(args *TaskArgs, reply *TaskReply) error {
 		filename, _ := c.MQueue.Dequeue()
 		reply.Filename = append(reply.Filename, filename)
 		reply.NReduce = c.NReduce
-		log.Printf("assign map task file %v to worker %v, remaining rtasks %v", filename, args.Id, len(c.MQueue.items))
+		DPrintf("assign map task file %v to worker %v, remaining rtasks %v", filename, args.Id, len(c.MQueue.items))
 		taskDoneKey := strconv.Itoa(args.Id) + "_" + reply.TransactionId
 		c.TaskDoneChanLock.Lock()
 		c.TaskDoneChan[taskDoneKey] = make(chan bool)
@@ -73,7 +73,7 @@ func (c *Coordinator) GetTasks(args *TaskArgs, reply *TaskReply) error {
 		reply.Filename = append(reply.Filename, c.RQueue[taskId]...)
 		reply.TransactionId = uuid.NewString()
 		reply.NReduce = 1
-		log.Printf("assign reduce task id %v to worker %v, remaining rtasks %v", taskId, args.Id, len(c.RTaskIds.items))
+		DPrintf("assign reduce task id %v to worker %v, remaining rtasks %v", taskId, args.Id, len(c.RTaskIds.items))
 		taskDoneKey := strconv.Itoa(args.Id) + "_" + reply.TransactionId
 		c.TaskDoneChanLock.Lock()
 		c.TaskDoneChan[taskDoneKey] = make(chan bool)
@@ -98,11 +98,11 @@ func (c *Coordinator) waitTask(reply *TaskReply, workerId int) {
 	
 	workerIdString := strconv.Itoa(workerId)
 	taskDoneKey := workerIdString + "_" + reply.TransactionId
-	timeout := 10
 	c.TaskDoneChanLock.Lock()
 	ch := c.TaskDoneChan[taskDoneKey]
 	c.TaskDoneChanLock.Unlock()
-	if taskType == "map" {
+	switch taskType {
+	case "map":
 		select {
 		case <- ch:
 			_, base := getDirFilename(reply.Filename[0])
@@ -120,26 +120,28 @@ func (c *Coordinator) waitTask(reply *TaskReply, workerId int) {
 				for i := range c.NReduce {
 					c.RTaskIds.Enqueue(i)
 				}
-				// log.Printf("---->\n\n c.RQueue: %v\n--------->\n\n", c.RQueue)
 			}
-			if c.ProcessedMapTasks > c.TotalSplits * c.NReduce {
-				panic("fucking overcooking")
-			}
+			// 
+			// assert
+			//
+			// if c.ProcessedMapTasks > c.TotalSplits * c.NReduce {
+			// 	panic("fucking overcooking")
+			// }
 			c.TaskDoneChanLock.Lock()
 			defer c.TaskDoneChanLock.Unlock()
 			delete(c.TaskDoneChan, taskDoneKey)
 			
-		case <- time.After(time.Duration(timeout) * time.Second):
+		case <- time.After(c.WaitTimeouts):
 			c.MQueueLock.Lock()
 			defer c.MQueueLock.Unlock()
 			c.MQueue.Enqueue(reply.Filename[0])
-			log.Printf("coordinator stop waiting worker %v for map task file %v", workerId, reply.Filename[0])
+			DPrintf("coordinator stop waiting worker %v for map task file %v", workerId, reply.Filename[0])
 			c.TaskDoneChanLock.Lock()
 			defer c.TaskDoneChanLock.Unlock()
 			delete(c.TaskDoneChan, taskDoneKey)
 		}
 		
-	} else if taskType == "reduce" {
+	case "reduce":
 		select {
 			case <- ch:
 				// rename the output file
@@ -156,13 +158,13 @@ func (c *Coordinator) waitTask(reply *TaskReply, workerId int) {
 				c.TaskDoneChanLock.Lock()
 				defer c.TaskDoneChanLock.Unlock()
 				delete(c.TaskDoneChan, taskDoneKey)
-			case <- time.After(time.Duration(timeout) * time.Second):
+			case <- time.After(c.WaitTimeouts):
 				parts := strings.Split(reply.Filename[0], "_")
 				taskId, _ := strconv.Atoi(parts[2])
 				c.RQueueLock.Lock()
 				defer c.RQueueLock.Unlock()
 				c.RTaskIds.Enqueue(taskId)
-				log.Printf("coordinator stop waiting worker %v for reduce task id %v", workerId, taskId)
+				DPrintf("coordinator stop waiting worker %v for reduce task id %v", workerId, taskId)
 				c.TaskDoneChanLock.Lock()
 				defer c.TaskDoneChanLock.Unlock()
 				delete(c.TaskDoneChan, taskDoneKey)

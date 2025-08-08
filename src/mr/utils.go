@@ -3,7 +3,10 @@ package mr
 import (
 	"path/filepath"
 	"strings"
+	"log"
 )
+
+const DEBUG = false
 
 func getDirFilename(file string) (string, string) {
 	// Extract filename
@@ -18,14 +21,16 @@ func getDirFilename(file string) (string, string) {
 	return dir, name
 }
 
-func removeExtension(filename string) string {
-	ext := filepath.Ext(filename)
-	return strings.TrimSuffix(filename, ext)
-}
-
 
 func refactOutputFileName(filename string) string {
 	parts := strings.Split(filename, "_")
 	newFilename := strings.Join(parts[:3], "-")
 	return newFilename
+}
+
+
+func DPrintf(format string, v ...any) {
+	if DEBUG {
+		log.Printf(format, v...)
+	}
 }
