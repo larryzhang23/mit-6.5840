@@ -20,21 +20,20 @@ type Coordinator struct {
 	// Your definitions here.
 	TotalSplits int 
 	NReduce int
-	ProcessedMapTasks int
+
 	MQueue Queue[string]
-	RQueue map[int][]string
+	RQueue Queue[int]
 	DoneQueue Queue[string]
-	// RTaskStart and RTaskIds are guarded by RQueueLock
-	RTaskStart bool
-	RTaskIds Queue[int]
-	MQueueLock sync.Mutex
-	RQueueLock sync.Mutex
-	DoneQueueLock sync.Mutex
+	IntFileMaps *FileStore[int]
+	
 	WaitTimeouts time.Duration
 	IntermediateFilePrefix string
+
 	// for task done communication
-	TaskDoneChan map[string]chan bool
-	TaskDoneChanLock sync.Mutex
+	TaskDoneChan *MapChan[string]
+	MapTaskDone bool
+	Mu sync.Mutex
+
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -45,45 +44,36 @@ type Coordinator struct {
 func (c *Coordinator) GetTasks(args *TaskArgs, reply *TaskReply) error {
 	// default value of task is to let worker stand by
 	reply.TaskType = "hold"
-	c.MQueueLock.Lock()
-	defer c.MQueueLock.Unlock()
-	if !c.MQueue.IsEmpty() {
+	if filename, ok := c.MQueue.Dequeue(); ok {
 		reply.TaskType = "map"
 		reply.TransactionId = uuid.NewString()
-		filename, _ := c.MQueue.Dequeue()
 		reply.Filename = append(reply.Filename, filename)
 		reply.NReduce = c.NReduce
-		DPrintf("assign map task file %v to worker %v, remaining rtasks %v", filename, args.Id, len(c.MQueue.items))
+		DPrintf("assign map task file %v to worker %v, remaining rtasks %v", filename, args.Id, c.MQueue.Len())
 		taskDoneKey := strconv.Itoa(args.Id) + "_" + reply.TransactionId
-		c.TaskDoneChanLock.Lock()
-		c.TaskDoneChan[taskDoneKey] = make(chan bool)
-		c.TaskDoneChanLock.Unlock()
+		c.TaskDoneChan.NewChan(taskDoneKey)
 		go c.waitTask(reply, args.Id)
 		return nil
 	} 
-	c.RQueueLock.Lock()
-	defer c.RQueueLock.Unlock()
+
 	// see if we are ready to start the reduce tasks, if not, just let worker stand by
-	if !c.RTaskStart {
+	c.Mu.Lock()
+	defer c.Mu.Unlock()
+	if !c.MapTaskDone {
 		return nil
 	}
-	if !c.RTaskIds.IsEmpty() {
+	if taskId, ok := c.RQueue.Dequeue(); ok {
 		reply.TaskType = "reduce"
-		taskId, _ := c.RTaskIds.Dequeue()
-		reply.Filename = append(reply.Filename, c.RQueue[taskId]...)
+		reply.Filename = append(reply.Filename, c.IntFileMaps.GetFiles(taskId)...)
 		reply.TransactionId = uuid.NewString()
 		reply.NReduce = 1
-		DPrintf("assign reduce task id %v to worker %v, remaining rtasks %v", taskId, args.Id, len(c.RTaskIds.items))
+		DPrintf("assign reduce task id %v to worker %v, remaining rtasks %v", taskId, args.Id, c.RQueue.Len())
 		taskDoneKey := strconv.Itoa(args.Id) + "_" + reply.TransactionId
-		c.TaskDoneChanLock.Lock()
-		c.TaskDoneChan[taskDoneKey] = make(chan bool)
-		c.TaskDoneChanLock.Unlock()
+		c.TaskDoneChan.NewChan(taskDoneKey)
 		go c.waitTask(reply, args.Id)
 		return nil
 	}
-	c.DoneQueueLock.Lock()
-	defer c.DoneQueueLock.Unlock()
-	if len(c.DoneQueue.items) == c.NReduce {
+	if c.DoneQueue.Len() == c.NReduce {
 		reply.TaskType = "exit"
 		return nil
 	}
@@ -98,28 +88,25 @@ func (c *Coordinator) waitTask(reply *TaskReply, workerId int) {
 	
 	workerIdString := strconv.Itoa(workerId)
 	taskDoneKey := workerIdString + "_" + reply.TransactionId
-	c.TaskDoneChanLock.Lock()
-	ch := c.TaskDoneChan[taskDoneKey]
-	c.TaskDoneChanLock.Unlock()
+	ch := c.TaskDoneChan.GetChan(taskDoneKey)
 	switch taskType {
 	case "map":
 		select {
 		case <- ch:
 			_, base := getDirFilename(reply.Filename[0])
-			c.RQueueLock.Lock()
-			defer c.RQueueLock.Unlock()
 			var rfilename string
 			for i := range c.NReduce {
 				rfilename = c.IntermediateFilePrefix + "_" + strconv.Itoa(i) + "_" + base + "_" + workerIdString
-				c.RQueue[i] = append(c.RQueue[i], rfilename)
-				c.ProcessedMapTasks += 1
+				c.IntFileMaps.AddFile(i, rfilename)
 			}
 			// will be set one time when the RQueue is full
-			if !c.RTaskStart && c.ProcessedMapTasks == c.TotalSplits * c.NReduce {
-				c.RTaskStart = true
+			c.Mu.Lock()
+			defer c.Mu.Unlock()
+			if !c.MapTaskDone && c.IntFileMaps.IsAllFiles() {
 				for i := range c.NReduce {
-					c.RTaskIds.Enqueue(i)
+					c.RQueue.Enqueue(i)
 				}
+				c.MapTaskDone = true 
 			}
 			// 
 			// assert
@@ -127,18 +114,12 @@ func (c *Coordinator) waitTask(reply *TaskReply, workerId int) {
 			// if c.ProcessedMapTasks > c.TotalSplits * c.NReduce {
 			// 	panic("fucking overcooking")
 			// }
-			c.TaskDoneChanLock.Lock()
-			defer c.TaskDoneChanLock.Unlock()
-			delete(c.TaskDoneChan, taskDoneKey)
+			c.TaskDoneChan.DeleteChan(taskDoneKey)
 			
 		case <- time.After(c.WaitTimeouts):
-			c.MQueueLock.Lock()
-			defer c.MQueueLock.Unlock()
 			c.MQueue.Enqueue(reply.Filename[0])
 			DPrintf("coordinator stop waiting worker %v for map task file %v", workerId, reply.Filename[0])
-			c.TaskDoneChanLock.Lock()
-			defer c.TaskDoneChanLock.Unlock()
-			delete(c.TaskDoneChan, taskDoneKey)
+			c.TaskDoneChan.DeleteChan(taskDoneKey)
 		}
 		
 	case "reduce":
@@ -148,26 +129,18 @@ func (c *Coordinator) waitTask(reply *TaskReply, workerId int) {
 				filenamePattern := strings.Join(strings.Split(reply.Filename[0], "_")[:3], "_")
 				tempFilename := filenamePattern + "_" + strconv.Itoa(workerId)
 				outputFilename := filepath.Join(".", refactOutputFileName(tempFilename))
-				c.DoneQueueLock.Lock()
-				defer c.DoneQueueLock.Unlock()
 				err := os.Rename(tempFilename, outputFilename)
 				if err != nil {
 					log.Fatalf("Rename error for %v", tempFilename)
 				}
 				c.DoneQueue.Enqueue(outputFilename)
-				c.TaskDoneChanLock.Lock()
-				defer c.TaskDoneChanLock.Unlock()
-				delete(c.TaskDoneChan, taskDoneKey)
+				c.TaskDoneChan.DeleteChan(taskDoneKey)
 			case <- time.After(c.WaitTimeouts):
 				parts := strings.Split(reply.Filename[0], "_")
 				taskId, _ := strconv.Atoi(parts[2])
-				c.RQueueLock.Lock()
-				defer c.RQueueLock.Unlock()
-				c.RTaskIds.Enqueue(taskId)
+				c.RQueue.Enqueue(taskId)
 				DPrintf("coordinator stop waiting worker %v for reduce task id %v", workerId, taskId)
-				c.TaskDoneChanLock.Lock()
-				defer c.TaskDoneChanLock.Unlock()
-				delete(c.TaskDoneChan, taskDoneKey)
+				c.TaskDoneChan.DeleteChan(taskDoneKey)
 
 		}
 	}
@@ -181,10 +154,7 @@ func (c *Coordinator) SetTaskDone(args *CallBackArgs, reply *CallBackReply) erro
 
 	if taskType == "map" || taskType == "reduce" {
 		// if no chan exists, it means the coordinator gave up the worker
-		c.TaskDoneChanLock.Lock()
-		defer c.TaskDoneChanLock.Unlock()
-		if ch, ok := c.TaskDoneChan[taskDoneKey]; ok {
-			ch <- true
+		if ok := c.TaskDoneChan.SendSignal(taskDoneKey); ok {
 			return nil
 		} else {
 			return fmt.Errorf("For task %v: coordinator stop waiting %v", taskType, workerId)
@@ -218,11 +188,9 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-	c.DoneQueueLock.Lock()
-	if len(c.DoneQueue.items) == c.NReduce {
+	if c.DoneQueue.Len() == c.NReduce {
 		ret = true
 	}
-	c.DoneQueueLock.Unlock()
 
 	return ret
 }
@@ -238,16 +206,15 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// Your code here.
 	c.NReduce = nReduce
 	c.TotalSplits = len(files)
-	c.ProcessedMapTasks = 0
 	c.WaitTimeouts = 10 * time.Second
 	c.IntermediateFilePrefix = "mr_out"
-	c.RTaskStart = false
-	c.TaskDoneChan = make(map[string]chan bool)
+
+	c.TaskDoneChan = NewMapChan[string]()
 	// no need to acquire the lock because we are not accepting request yet
 	for _, filename := range files {
 		c.MQueue.Enqueue(filename)
 	}
-	c.RQueue = make(map[int][]string)
+	c.IntFileMaps = NewMapString[int](len(files), nReduce)
 
 	c.server()
 	return &c
