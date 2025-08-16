@@ -232,19 +232,41 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 
-// func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-// 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-// 	return ok
-// }
-
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, resp chan *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if ok {
-		resp <- reply
-	} else {
-		resp <- &RequestVoteReply{VoteGranted: false, Term: -1}
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// if more than a half votegranted, rf.state will be leader 
+		// if it is a outdated leader, rf.state will be changed back to follower
+		// thus, only need to process while it is still a candidate
+		if rf.state == Candidate {
+			if reply.VoteGranted {
+				rf.votesCount++
+				majority := len(rf.peers) / 2 + 1
+				if rf.votesCount + 1 >= majority {
+					rf.LeaderInit()
+				}
+			} else {
+				rf.UpdateTermAndStateIfPossible(reply.Term)
+			}
+		}
 	}
 	return ok
+}
+
+func (rf *Raft) LeaderInit() {
+	rf.state = Leader
+	// TODO: some initialization of the nextIdx and matchIdx
+	rfLastLogIdx := len(rf.logs) - 1
+	nextLogIdx := rfLastLogIdx + 1
+	for i := range rf.nextIdx {
+		rf.nextIdx[i] = nextLogIdx
+		rf.matchIdx[i] = -1
+	}
+	// start heartbeats goroutine
+	go rf.syncup()
+	DPrintf("%v becomes a leader\n", rf.me)
 }
 
 
@@ -311,51 +333,14 @@ func (rf *Raft) handleLeaderSelection() {
 		LastLogIdx: rfLastLogIdx,
 	}
 
-	resp := make(chan *RequestVoteReply, len(rf.peers) - 1)
 	
 	for i := range rf.peers {
 		if i == rf.me {
 			continue 
 		} 
 		reply := RequestVoteReply{}
-		go rf.sendRequestVote(i, &args, &reply, resp)
+		go rf.sendRequestVote(i, &args, &reply)
 	}
-
-	// handle RequestVote RPC response
-	respCount := 0
-	votesCount := 0
-	majority := len(rf.peers) / 2 + 1
-	for reply := range resp {
-		if reply.VoteGranted {
-			votesCount++
-			// jump out ahead when getting majority vote
-			if votesCount + 1 >= majority {
-				break 
-			}
-		} else {
-			rf.UpdateTermAndStateIfPossible(reply.Term)
-			if rf.state == Follower {
-				return 
-			}
-		}
-		respCount++
-		if respCount == len(rf.peers) - 1 {
-			break 
-		}
-	}
-	
-	if votesCount + 1 >= majority {
-		rf.state = Leader 
-		// TODO: some initialization of the nextIdx and matchIdx
-		nextLogIdx := rfLastLogIdx + 1
-		for i := range rf.nextIdx {
-			rf.nextIdx[i] = nextLogIdx
-			rf.matchIdx[i] = -1
-		}
-		// start heartbeats goroutine
-		go rf.syncup()
-		DPrintf("%v becomes a leader\n", rf.me)
-	} 
 }
 
 func (rf *Raft) ticker() {
