@@ -373,15 +373,12 @@ func (rf *Raft) ticker() {
 			// rf.tick is set in the rpc AppendEntries
 			if rf.tick {
 				rf.tick = false 
-				rf.mu.Unlock()
 			} else {
 				DPrintf("%v times out at term %v\n", rf.me, rf.currentTerm)
 				rf.handleLeaderSelection()
-				rf.mu.Unlock()
 			}
-		} else {
-			rf.mu.Unlock()
-		}
+		} 
+		rf.mu.Unlock()
 	}
 }
 
