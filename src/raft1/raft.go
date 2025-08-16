@@ -421,10 +421,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 		rf.UpdateTermAndStateIfPossible(reply.Term)
-		if rf.state == Follower {
-			return ok
+		if rf.state == Leader {
+			// TODO: handle reply
 		}
-		// TODO: handle reply
 	}
 	return ok
 }
