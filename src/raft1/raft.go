@@ -263,6 +263,9 @@ func (rf *Raft) LeaderInit() {
 	rfLastLogIdx := len(rf.logs) - 1
 	nextLogIdx := rfLastLogIdx + 1
 	for i := range rf.nextIdx {
+		if i == rf.me {
+			continue 
+		}
 		rf.nextIdx[i] = nextLogIdx
 		rf.matchIdx[i] = 0
 	}
@@ -304,9 +307,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// start the agreement service 
 	newLog := Log{Term: term, Command: command}
 	rf.logs = append(rf.logs, newLog)
-	// because the tester is index-1 based, so we return len(rf.logs)
 	index = len(rf.logs) - 1
-	DPrintf("Leader %v add one log, now logs length: %v\n", rf.me, len(rf.logs))
 
 	return index, term, isLeader
 }
@@ -426,13 +427,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// compare prevLogIdx and prevLogTerm
 		if len(rf.logs) > args.PrevLogIdx {
 			if rf.logs[args.PrevLogIdx].Term == args.PrevLogTerm {
-				
 				// set reply to be successful
 				reply.Success = true 
 				// append new entries
 				if len(args.Entries) > 0 {
-					rf.logs = append(rf.logs, args.Entries...)
-					DPrintf("Follower %v logs length is %v\n", rf.me, len(rf.logs))
+					// can't just simply append, because the prevLogIdx maybe smaller than the actual rf.logs which contain uncommited logs
+					// rf.logs = append(rf.logs, args.Entries...)
+					rf.logs = append(rf.logs[:args.PrevLogIdx + 1], args.Entries...)
 				}
 				// update commitedIdx
 				if args.LeaderCommit > rf.commitedIdx {
@@ -443,7 +444,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				rf.logs = rf.logs[:args.PrevLogIdx]
 			}
-		} 
+		}
 	}
 }
 
@@ -505,8 +506,6 @@ func (rf *Raft) handleAppendEntries() {
 		var logs []Log
 		if rf.nextIdx[i] < len(rf.logs) {
 			logs = rf.logs[rf.nextIdx[i]:]
-		} else {
-			logs = []Log{}
 		}
 		
 		args := AppendEntriesArgs{
