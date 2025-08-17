@@ -259,9 +259,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) LeaderInit() {
 	rf.state = Leader
-	// TODO: some initialization of the nextIdx and matchIdx
-	rfLastLogIdx := len(rf.logs) - 1
-	nextLogIdx := rfLastLogIdx + 1
+	nextLogIdx := len(rf.logs)
 	for i := range rf.nextIdx {
 		if i == rf.me {
 			continue 
@@ -408,6 +406,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int 
 	Success bool
+	// if fail, suggest leader to compare NextIdx in the next rpc
+	NextIdx int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -442,8 +442,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					go rf.commitLogs(lastCommitedIdx + 1, rf.commitedIdx)
 				}
 			} else {
-				rf.logs = rf.logs[:args.PrevLogIdx]
+				// rf.logs = rf.logs[:args.PrevLogIdx]
+				term := rf.logs[args.PrevLogIdx].Term
+				nextIdx := 0
+				for i := args.PrevLogIdx - 1; i >= 1; i-- {
+					if rf.logs[i].Term < term {
+						nextIdx = args.PrevLogIdx
+						break 
+					}
+				}
+				reply.NextIdx = nextIdx
 			}
+		} else {
+			reply.NextIdx = len(rf.logs) - 1
 		}
 	}
 }
@@ -488,7 +499,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 					}
 				}
 			} else {
-				rf.nextIdx[server] = max(rf.nextIdx[server] - 1, rf.matchIdx[server] + 1)
+				// rf.nextIdx[server] = max(rf.nextIdx[server] - 1, rf.matchIdx[server] + 1)
+				rf.nextIdx[server] = reply.NextIdx + 1
 			}
 		}
 	}
