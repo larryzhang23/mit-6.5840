@@ -437,11 +437,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// update commitedIdx
 				if args.LeaderCommit > rf.commitedIdx {
 					lastCommitedIdx := rf.commitedIdx
-					if args.LeaderCommit >= len(rf.logs) {
-						rf.commitedIdx = len(rf.logs) - 1
-					} else {
-						rf.commitedIdx = args.LeaderCommit
-					}
+					rf.commitedIdx = min(len(rf.logs) - 1, args.LeaderCommit)
 					go rf.commitLogs(lastCommitedIdx + 1, rf.commitedIdx)
 				}
 			} else {
@@ -476,8 +472,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 							}
 							if rf.matchIdx[i] >= matchIdx {
 								replicateCnt++
+								// more than a half agree, break
+								if replicateCnt + 1 >= majority {
+									break
+								}
 							}
 						}
+						// increate commitedIdx
 						if replicateCnt + 1 >= majority {
 							lastCommited := rf.commitedIdx
 							rf.commitedIdx = matchIdx
@@ -486,7 +487,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 					}
 				}
 			} else {
-				rf.nextIdx[server]--
+				rf.nextIdx[server] = max(rf.nextIdx[server] - 1, rf.matchIdx[server] + 1)
 			}
 		}
 	}

@@ -10,3 +10,19 @@ func DPrintf(format string, a ...interface{}) {
 		log.Printf(format, a...)
 	}
 }
+
+func min(val1, val2 int) int {
+	if val1 < val2 {
+		return val1
+	} else {
+		return val2 
+	}
+}
+
+func max(val1, val2 int) int {
+	if val1 > val2 {
+		return val1 
+	} else {
+		return val2 
+	}
+}
