@@ -161,7 +161,7 @@ type RequestVoteReply struct {
 }
 
 
-func (rf *Raft) UpdateTermAndStateIfPossible(term int) {
+func (rf *Raft) updateTermAndStateIfPossible(term int) {
 	// assume lock acquired
 	// implement rule 2 for all servers in the paper
 	if term > rf.currentTerm {
@@ -183,7 +183,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	// implement rule 2 for all servers in the paper
-	rf.UpdateTermAndStateIfPossible(reqTerm)
+	rf.updateTermAndStateIfPossible(reqTerm)
 	// set default to be deny voting
 	reply.VoteGranted = false 
 	if rf.currentTerm == reqTerm {
@@ -244,17 +244,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 				rf.votesCount++
 				majority := len(rf.peers) / 2 + 1
 				if rf.votesCount + 1 >= majority {
-					rf.LeaderInit()
+					rf.leaderInit()
 				}
 			} else {
-				rf.UpdateTermAndStateIfPossible(reply.Term)
+				rf.updateTermAndStateIfPossible(reply.Term)
 			}
 		}
 	}
 	return ok
 }
 
-func (rf *Raft) LeaderInit() {
+func (rf *Raft) leaderInit() {
 	rf.state = Leader
 	nextLogIdx := len(rf.logs)
 	for i := range rf.nextIdx {
@@ -412,7 +412,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	// implement rule 2 for all servers
-	rf.UpdateTermAndStateIfPossible(args.Term)
+	rf.updateTermAndStateIfPossible(args.Term)
 	reply.Success = false 
 	if args.Term == rf.currentTerm {
 		rf.tick = true 
@@ -465,7 +465,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.UpdateTermAndStateIfPossible(reply.Term)
+		rf.updateTermAndStateIfPossible(reply.Term)
 		if rf.state == Leader {
 			// handle response
 			if reply.Success {
