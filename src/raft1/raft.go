@@ -515,9 +515,12 @@ func (rf *Raft) handleAppendEntries() {
 			continue
 		}
 		prevLogTerm := rf.logs[rf.nextIdx[i] - 1].Term
-		var logs []Log
+		var entries []Log
 		if rf.nextIdx[i] < len(rf.logs) {
-			logs = rf.logs[rf.nextIdx[i]:]
+			// When the server is a outdated leader and the real leader call us,
+			// it might change rf.logs during the gob encoding time(ok := rf.peers[server].Call("Raft.AppendEntries", args, reply))
+			entries = make([]Log, len(rf.logs[rf.nextIdx[i]:]))
+			copy(entries, rf.logs[rf.nextIdx[i]:])
 		}
 		
 		args := AppendEntriesArgs{
@@ -526,7 +529,7 @@ func (rf *Raft) handleAppendEntries() {
 			PrevLogIdx: rf.nextIdx[i] - 1,
 			PrevLogTerm: prevLogTerm,
 			LeaderCommit: rf.commitedIdx,
-			Entries: logs,
+			Entries: entries,
 		}
 		reply := AppendEntriesReply{}
 		go rf.sendAppendEntries(i, &args, &reply)
