@@ -192,13 +192,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rfLastLogIdx := len(rf.logs) - 1
 			rfLastLogTerm := rf.logs[rfLastLogIdx].Term
 			if rfLastLogTerm < reqLastLogTerm || (rfLastLogTerm == reqLastLogTerm && rfLastLogIdx <= reqLastLogIdx) {
-				// log.Printf("(req %v, me %v): req last term(%v) and last idx(%v); my last term(%v) and last idx(%v)\n", candidateId, rf.me, reqLastLogTerm, reqLastLogIdx, rfLastLogTerm, rfLastLogIdx)
 				reply.VoteGranted = true
 				rf.voteFor = candidateId
 				// reset timer
-				oldtickState := rf.tick
 				rf.tick = true
-				DPrintf("%v acknowledge %v as leader and update timer(old value: %v) \n", rf.me, args.CandidateId, oldtickState)
 			} 
 		} 
 	}
@@ -269,7 +266,7 @@ func (rf *Raft) LeaderInit() {
 	}
 	// start heartbeats goroutine
 	go rf.syncup()
-	// log.Printf("%v becomes a leader\n", rf.me)
+	DPrintf("%v becomes a leader\n", rf.me)
 }
 
 
@@ -372,7 +369,7 @@ func (rf *Raft) ticker() {
 			if rf.tick {
 				rf.tick = false 
 			} else {
-				DPrintf("%v times out at term %v\n", rf.me, rf.currentTerm)
+				// DPrintf("%v times out at term %v\n", rf.me, rf.currentTerm)
 				rf.handleLeaderSelection()
 			}
 		} 
@@ -418,7 +415,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.UpdateTermAndStateIfPossible(args.Term)
 	reply.Success = false 
 	if args.Term == rf.currentTerm {
-		DPrintf("%v receive heartbeats from %v and update timer(old value: %v) \n", rf.me, args.LeaderId, rf.tick)
 		rf.tick = true 
 		// fix those who transformed from candidate or expired leader in rf.UpdateTermAndStateIfPossible
 		if rf.voteFor == -1 {
@@ -439,21 +435,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				if args.LeaderCommit > rf.commitedIdx {
 					lastCommitedIdx := rf.commitedIdx
 					rf.commitedIdx = min(len(rf.logs) - 1, args.LeaderCommit)
+					DPrintf("Follower %v updates commitedIdx from %v to %v at term %v\n", rf.me, lastCommitedIdx, rf.commitedIdx, rf.currentTerm)
 					go rf.commitLogs(lastCommitedIdx + 1, rf.commitedIdx)
 				}
 			} else {
 				// rf.logs = rf.logs[:args.PrevLogIdx]
+				// skip the whole term if failed
 				term := rf.logs[args.PrevLogIdx].Term
 				nextIdx := 0
 				for i := args.PrevLogIdx - 1; i >= 1; i-- {
 					if rf.logs[i].Term < term {
-						nextIdx = args.PrevLogIdx
+						nextIdx = i
 						break 
 					}
 				}
+				DPrintf("Follower %v informs leader to check nextIdx starting at %v (term %v) (current check %v (term %v))\n", rf.me, nextIdx, rf.logs[nextIdx].Term, args.PrevLogIdx, args.PrevLogTerm)
 				reply.NextIdx = nextIdx
 			}
 		} else {
+			DPrintf("Follower %v doesn't have %v index, shrink to last index in logs %v\n", rf.me, args.PrevLogIdx, len(rf.logs) - 1)
 			reply.NextIdx = len(rf.logs) - 1
 		}
 	}
@@ -494,6 +494,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 						if replicateCnt + 1 >= majority {
 							lastCommited := rf.commitedIdx
 							rf.commitedIdx = matchIdx
+							DPrintf("Leader %v updates commitedIdx from %v to %v at term %v\n", rf.me, lastCommited, rf.commitedIdx, rf.currentTerm)
 							go rf.commitLogs(lastCommited + 1, rf.commitedIdx)
 						}
 					}

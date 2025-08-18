@@ -2,7 +2,7 @@
 
 fail=0
 success=0
-ROUNDS=10
+ROUNDS=100
 
 for ((i=1; i<=ROUNDS; i++)); do
     echo "=========================="
