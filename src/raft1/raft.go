@@ -9,12 +9,15 @@ package raft
 import (
 	//	"bytes"
 	// "log"
+	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -103,12 +106,23 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	// assume lock is acquired when the function is called
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.logs)
+	raftState := w.Bytes()
+	// TODO: change second parameter in (3D)
+	rf.persister.Save(raftState, nil)
 }
 
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	// nil slice len() is zero
+	if len(data) < 1 { // bootstrap without any state?
 		return
 	}
 	// Your code here (3C).
@@ -124,6 +138,29 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int 
+	var voteFor int 
+	var logs []Log 
+	if err := d.Decode(&currentTerm); err != nil {
+		log.Fatalf("Server %v load currentTerm from persister fails with err %v\n", rf.me, err)
+	}
+	if err := d.Decode(&voteFor); err != nil {
+		log.Fatalf("Server %v load voteFor from persister fails with err %v\n", rf.me, err)
+	}
+	if err := d.Decode(&logs); err != nil {
+		log.Fatalf("Server %v load logs from persister fails with err %v\n", rf.me, err)
+	}
+	rf.currentTerm = currentTerm
+	rf.voteFor = voteFor
+	rf.logs = logs 
+	// update termLastEntry
+	for i, log := range rf.logs {
+		rf.termLastEntry[log.Term] = i
+	}
+	DPrintf("Server %v read persistence done\n", rf.me)
+	
 }
 
 // how many bytes in Raft's persisted log?
@@ -163,15 +200,18 @@ type RequestVoteReply struct {
 }
 
 
-func (rf *Raft) updateTermAndStateIfPossible(term int) {
+func (rf *Raft) updateTermAndStateIfPossible(term int) bool {
 	// assume lock acquired
 	// implement rule 2 for all servers in the paper
+	// return value represents if the server is updated or not(for 3C)
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.voteFor = -1 
 		rf.state = Follower
 		rf.votesCount = -1
+		return true 
 	}
+	return false 
 }
 
 // example RequestVote RPC handler.
@@ -185,7 +225,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	// implement rule 2 for all servers in the paper
-	rf.updateTermAndStateIfPossible(reqTerm)
+	updatePersist := rf.updateTermAndStateIfPossible(reqTerm)
 	// set default to be deny voting
 	reply.VoteGranted = false 
 	if rf.currentTerm == reqTerm {
@@ -196,13 +236,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			if rfLastLogTerm < reqLastLogTerm || (rfLastLogTerm == reqLastLogTerm && rfLastLogIdx <= reqLastLogIdx) {
 				reply.VoteGranted = true
 				rf.voteFor = candidateId
+				updatePersist = true
 				// reset timer
 				rf.tick = true
 			} 
 		} 
 	}
-
-
+	// check if we need to update persisters
+	if updatePersist {
+		rf.persist()
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -241,6 +284,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		// if more than a half votegranted, rf.state will be leader 
 		// if it is a outdated leader, rf.state will be changed back to follower
 		// thus, only need to process while it is still a candidate
+		// implement rule 2 for all servers
+		updatePersist := rf.updateTermAndStateIfPossible(reply.Term)
 		if rf.state == Candidate {
 			if reply.VoteGranted {
 				rf.votesCount++
@@ -248,9 +293,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 				if rf.votesCount + 1 >= majority {
 					rf.leaderInit()
 				}
-			} else {
-				rf.updateTermAndStateIfPossible(reply.Term)
 			}
+		}
+		if updatePersist {
+			rf.persist()
 		}
 	}
 	return ok
@@ -259,6 +305,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) leaderInit() {
 	rf.state = Leader
 	nextLogIdx := len(rf.logs)
+	if nextLogIdx == 0 {
+		DPrintf("Leader %v logs becomes empty which is impossible!", rf.me)
+	}
 	for i := range rf.nextIdx {
 		if i == rf.me {
 			continue 
@@ -307,6 +356,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.logs) - 1
 	// update last entry of term if necessary
 	rf.termLastEntry[term] = index
+	// update persist
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -347,6 +398,8 @@ func (rf *Raft) handleLeaderSelection() {
 		LastLogIdx: rfLastLogIdx,
 	}
 
+	// update persist
+	rf.persist()
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -418,14 +471,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	// implement rule 2 for all servers
-	rf.updateTermAndStateIfPossible(args.Term)
+	updatePersist := rf.updateTermAndStateIfPossible(args.Term)
+	if !updatePersist && args.Term != rf.currentTerm {
+		DPrintf("Follower %v (term %v) and Leader %v (term %v)\n", rf.me, rf.currentTerm, args.LeaderId, args.Term)
+	}
 	reply.Success = false 
+	//
+	// Set reply.XLen to -1 telling leader it is a failed request(if it is not updated in the following logic) because of term
+	// This is for unreliable network where the follower rejects the leader because of term but later on 
+	// the same leader was selected with higher term 
+	//
+	reply.XLen = -1
+	reply.XIndex = -1
+	reply.XTerm = -1
 	if args.Term == rf.currentTerm {
 		rf.tick = true 
 		// fix those who transformed from candidate or expired leader in rf.UpdateTermAndStateIfPossible
 		if rf.voteFor == -1 {
 			rf.voteFor = args.LeaderId
+			updatePersist = true
 		}
+		// since the term of follower doesn't conflict with the requested leader, we set the XLen to the logs length
+		reply.XLen = len(rf.logs)
 		// compare prevLogIdx and prevLogTerm
 		if len(rf.logs) > args.PrevLogIdx {
 			if rf.logs[args.PrevLogIdx].Term == args.PrevLogTerm {
@@ -452,6 +519,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 						rf.logs = append(rf.logs, log)
 					}
 					rf.termLastEntry = newTermLastEntry
+					updatePersist = true 
 				}
 				// update commitedIdx
 				if args.LeaderCommit > rf.commitedIdx {
@@ -471,14 +539,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					}
 				}
 				reply.XIndex = rf.termLastEntry[lastTerm] + 1
-				reply.XLen = len(rf.logs)
-				DPrintf("Follower %v return first index %v of the conflict term %v\n", rf.me, reply.XIndex, term)
+				DPrintf("AppendEntries Failed from Leader %v; Follower %v return first index %v of the conflict term %v\n", args.LeaderId, rf.me, reply.XIndex, term)
 			}
-		} else {
-			reply.XLen = len(rf.logs)
-			reply.XTerm = -1
-			reply.XIndex = -1
 		}
+	}
+	if updatePersist {
+		rf.persist()
 	}
 }
 
@@ -488,7 +554,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.updateTermAndStateIfPossible(reply.Term)
+		updatePersist := rf.updateTermAndStateIfPossible(reply.Term)
 		if rf.state == Leader {
 			// handle response
 			if reply.Success {
@@ -525,14 +591,27 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			} else {
 				if reply.XTerm > 0 {
 					if idx, ok := rf.termLastEntry[reply.XTerm]; ok {
+						if idx == -1 {
+							DPrintf("Leader %v's last entry of term %v is -1 which is impossible\n", rf.me, reply.XTerm)
+						}
 						rf.nextIdx[server] = idx + 1 
 					} else {
 						rf.nextIdx[server] = reply.XIndex
+						if reply.XIndex == 0 {
+							DPrintf("Follower %v's first entry of term %v is 0 which is impossible(term > 1, index > 1 or term = 0 should succeed) \n", server, reply.XTerm)
+						}
 					}
-				} else {
+				} else if reply.XLen > 0 {
 					rf.nextIdx[server] = reply.XLen
+				} else {
+					// for debug purpose
+					DPrintf("Follower %v(term %v)'s XLen %v, XTerm %v XIndex %v rejects leader request because of term. Don't update anything and just retry", server, reply.Term, reply.XLen, reply.XTerm, reply.XIndex)
 				}
 			}
+		}
+
+		if updatePersist {
+			rf.persist()
 		}
 	}
 	return ok
@@ -603,14 +682,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votesCount = -1
 	rf.termLastEntry = map[int]int{0: 0}
 	rf.logs = append(rf.logs, Log{Term: rf.currentTerm})
-	// TODO: load it from persistent states
+
 	for range peers {
 		rf.nextIdx = append(rf.nextIdx, 1)
 		rf.matchIdx = append(rf.matchIdx, 0)
 	}
 
-
-	// initialize from state persisted before a crash
+	// initialize from state persisted before a crash	
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
