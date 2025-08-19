@@ -55,6 +55,8 @@ type Raft struct {
 	tick bool 
 	// count how many acknowlage from peers, used when it is a candidate
 	votesCount int 
+	// help find the nextIdx when appendEntries fails
+	termLastEntry map[int]int
 }
 
 type State int 
@@ -303,6 +305,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newLog := Log{Term: term, Command: command}
 	rf.logs = append(rf.logs, newLog)
 	index = len(rf.logs) - 1
+	// update last entry of term if necessary
+	rf.termLastEntry[term] = index
 
 	return index, term, isLeader
 }
@@ -403,8 +407,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int 
 	Success bool
-	// if fail, suggest leader to compare NextIdx in the next rpc
-	NextIdx int
+	// useful information for leader to decide nextIdx when request fails
+	XTerm int 
+	XIndex int 
+	XLen int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -427,9 +433,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				reply.Success = true 
 				// append new entries
 				if len(args.Entries) > 0 {
-					// can't just simply append, because the prevLogIdx maybe smaller than the actual rf.logs which contain uncommited logs
+					// can't just simply append, because the prevLogIdx maybe smaller than the actual rf.logs which contain uncommited logs, so the code in the next line is one of the bug taking me a while to fix
 					// rf.logs = append(rf.logs, args.Entries...)
-					rf.logs = append(rf.logs[:args.PrevLogIdx + 1], args.Entries...)
+
+					// update last entry of terms 
+					newTermLastEntry := make(map[int]int)
+					// remove the truncated terms in the map 
+					newTermLastEntry[args.PrevLogTerm] = args.PrevLogIdx
+					for k, v := range rf.termLastEntry {
+						if k < args.PrevLogTerm {
+							newTermLastEntry[k] = v
+						} 
+					}
+					// add new logs and update last entry of terms
+					rf.logs = rf.logs[:args.PrevLogIdx + 1]
+					for i, log := range args.Entries {
+						newTermLastEntry[log.Term] = i + args.PrevLogIdx + 1
+						rf.logs = append(rf.logs, log)
+					}
+					rf.termLastEntry = newTermLastEntry
 				}
 				// update commitedIdx
 				if args.LeaderCommit > rf.commitedIdx {
@@ -439,22 +461,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					go rf.commitLogs(lastCommitedIdx + 1, rf.commitedIdx)
 				}
 			} else {
-				// rf.logs = rf.logs[:args.PrevLogIdx]
-				// skip the whole term if failed
 				term := rf.logs[args.PrevLogIdx].Term
-				nextIdx := 0
-				for i := args.PrevLogIdx - 1; i >= 1; i-- {
-					if rf.logs[i].Term < term {
-						nextIdx = i
-						break 
+				reply.XTerm = term 
+				lastTerm := 0
+				// get the first index of the conflict term so that leader can use it to skip the current term
+				for t := range rf.termLastEntry {
+					if t < term && t > lastTerm {
+						lastTerm = t 
 					}
 				}
-				DPrintf("Follower %v informs leader to check nextIdx starting at %v (term %v) (current check %v (term %v))\n", rf.me, nextIdx, rf.logs[nextIdx].Term, args.PrevLogIdx, args.PrevLogTerm)
-				reply.NextIdx = nextIdx
+				reply.XIndex = rf.termLastEntry[lastTerm] + 1
+				reply.XLen = len(rf.logs)
+				DPrintf("Follower %v return first index %v of the conflict term %v\n", rf.me, reply.XIndex, term)
 			}
 		} else {
-			DPrintf("Follower %v doesn't have %v index, shrink to last index in logs %v\n", rf.me, args.PrevLogIdx, len(rf.logs) - 1)
-			reply.NextIdx = len(rf.logs) - 1
+			reply.XLen = len(rf.logs)
+			reply.XTerm = -1
+			reply.XIndex = -1
 		}
 	}
 }
@@ -500,8 +523,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 					}
 				}
 			} else {
-				// rf.nextIdx[server] = max(rf.nextIdx[server] - 1, rf.matchIdx[server] + 1)
-				rf.nextIdx[server] = reply.NextIdx + 1
+				if reply.XTerm > 0 {
+					if idx, ok := rf.termLastEntry[reply.XTerm]; ok {
+						rf.nextIdx[server] = idx + 1 
+					} else {
+						rf.nextIdx[server] = reply.XIndex
+					}
+				} else {
+					rf.nextIdx[server] = reply.XLen
+				}
 			}
 		}
 	}
@@ -571,6 +601,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitedIdx = 0
 	rf.lastApplied = 0
 	rf.votesCount = -1
+	rf.termLastEntry = map[int]int{0: 0}
 	rf.logs = append(rf.logs, Log{Term: rf.currentTerm})
 	// TODO: load it from persistent states
 	for range peers {
