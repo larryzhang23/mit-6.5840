@@ -18,11 +18,3 @@ func min(val1, val2 int) int {
 		return val2 
 	}
 }
-
-func max(val1, val2 int) int {
-	if val1 > val2 {
-		return val1 
-	} else {
-		return val2 
-	}
-}

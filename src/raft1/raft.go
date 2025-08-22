@@ -56,12 +56,12 @@ type Raft struct {
 	snapshot *SnapshotBody
 	lastSnapshotIndex int 
 
-	// tick sign, only used when it is not a leader 
-	tick bool 
 	// count how many acknowlage from peers, used when it is a candidate
 	votesCount int 
 	// help find the nextIdx when appendEntries fails, here the index is the logs array index not the log index
 	termLastEntry map[int]int
+	// heartbeat channel
+	heartbeatCh chan struct{}
 }
 
 type State int 
@@ -217,6 +217,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// apply a dummy term 0 log as the initial sentinel
 	rf.termLastEntry = map[int]int{0: 0}
 	rf.logs = append(rf.logs, Log{Term: rf.currentTerm, Index: 0})
+	// initialize heartbeat channel
+	rf.heartbeatCh = make(chan struct{})
 
 	for range peers {
 		rf.nextIdx = append(rf.nextIdx, 1)
@@ -408,7 +410,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				rf.voteFor = candidateId
 				updatePersist = true
 				// reset timer
-				rf.tick = true
+				rf.heartbeatCh <- struct{}{}
 			}
 		} 
 	}
@@ -520,26 +522,28 @@ func (rf *Raft) handleLeaderSelection() {
 }
 
 func (rf *Raft) ticker() {
+	ms := 600 + (rand.Int63() % 600)
+	timer := time.NewTimer(time.Duration(ms) * time.Millisecond)
+
 	for !rf.killed() {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		// ms := 50 + (rand.Int63() % 300)
-		ms := 600 + (rand.Int63() % 600)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-
-		// Your code here (3A)
-		// Check if a leader election should be started.
-		rf.mu.Lock()
-		if rf.state != Leader {
-			// rf.tick is set in the rpc AppendEntries
-			if rf.tick {
-				rf.tick = false 
-			} else {
+		select {
+		case <- timer.C:
+			rf.mu.Lock()
+			if rf.state != Leader {
 				// DPrintf("%v times out at term %v\n", rf.me, rf.currentTerm)
 				rf.handleLeaderSelection()
 			}
-		} 
-		rf.mu.Unlock()
+			rf.mu.Unlock()
+		case <- rf.heartbeatCh:
+			if !timer.Stop() {
+				<- timer.C
+			}
+		}
+		ms = 600 + (rand.Int63() % 600)
+		timer.Reset(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -577,7 +581,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.XIndex = -1
 	reply.XTerm = -1
 	if args.Term == rf.currentTerm {
-		rf.tick = true 
+		// reset timer 
+		rf.heartbeatCh <- struct{}{}
 		// fix those who transformed from candidate or expired leader in rf.UpdateTermAndStateIfPossible
 		if rf.voteFor == -1 {
 			rf.voteFor = args.LeaderId
@@ -755,6 +760,7 @@ func (rf *Raft) handleAppendEntries() {
 func (rf *Raft) syncup() {
 	ms := 100
 	for !rf.killed() {
+		<- time.After(time.Duration(ms) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.state != Leader {
 			rf.mu.Unlock()
@@ -762,7 +768,6 @@ func (rf *Raft) syncup() {
 		}
 		rf.handleAppendEntries()
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -788,7 +793,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// implement rule 2 for all servers
 	updatePersist := rf.updateTermAndStateIfPossible(args.Term)
 	if rf.currentTerm == args.Term {
-		rf.tick = true
+		// reset timer
+		rf.heartbeatCh <- struct{}{}
 		if rf.voteFor == -1 {
 			rf.voteFor = args.LeaderId
 			updatePersist = true
