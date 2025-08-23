@@ -62,6 +62,8 @@ type Raft struct {
 	termLastEntry map[int]int
 	// heartbeat channel
 	heartbeatCh chan struct{}
+	// A channel to inform short time running goroutine the server is closed
+	stopCh chan struct{}
 }
 
 type State int 
@@ -186,8 +188,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
+	// atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	if atomic.SwapInt32(&rf.dead, 1) == 0 {
+        close(rf.stopCh)
+    }
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -218,7 +223,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.termLastEntry = map[int]int{0: 0}
 	rf.logs = append(rf.logs, Log{Term: rf.currentTerm, Index: 0})
 	// initialize heartbeat channel
-	rf.heartbeatCh = make(chan struct{})
+	rf.heartbeatCh = make(chan struct{}, 1)
+	rf.stopCh = make(chan struct{})
 
 	for range peers {
 		rf.nextIdx = append(rf.nextIdx, 1)
@@ -393,12 +399,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reqLastLogIdx := args.LastLogIdx 
 	candidateId := args.CandidateId
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	// implement rule 2 for all servers in the paper
 	updatePersist := rf.updateTermAndStateIfPossible(reqTerm)
 	// set default to be deny voting
 	reply.VoteGranted = false 
+	resetTimer := false 
 	if rf.currentTerm == reqTerm {
 		// check votefor field
 		if rf.voteFor == -1 || rf.voteFor == candidateId {
@@ -409,8 +415,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				reply.VoteGranted = true
 				rf.voteFor = candidateId
 				updatePersist = true
-				// reset timer
-				rf.heartbeatCh <- struct{}{}
+				resetTimer = true
 			}
 		} 
 	}
@@ -418,6 +423,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if updatePersist {
 		rf.persist()
 	}
+	rf.mu.Unlock()
+	if resetTimer {
+		// reset timer and drop packet if there is already a heartbeat
+		select {
+		case rf.heartbeatCh <- struct{}{}:
+		default:
+		}
+	}
+	
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -538,9 +552,6 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 		case <- rf.heartbeatCh:
-			if !timer.Stop() {
-				<- timer.C
-			}
 		}
 		ms = 600 + (rand.Int63() % 600)
 		timer.Reset(time.Duration(ms) * time.Millisecond)
@@ -567,7 +578,6 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	// implement rule 2 for all servers
 	updatePersist := rf.updateTermAndStateIfPossible(args.Term)
@@ -580,9 +590,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.XLen = -1
 	reply.XIndex = -1
 	reply.XTerm = -1
+	resetTimer := false 
 	if args.Term == rf.currentTerm {
-		// reset timer 
-		rf.heartbeatCh <- struct{}{}
+		resetTimer = true 
 		// fix those who transformed from candidate or expired leader in rf.UpdateTermAndStateIfPossible
 		if rf.voteFor == -1 {
 			rf.voteFor = args.LeaderId
@@ -640,6 +650,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.persist()
 		}
 	}
+	rf.mu.Unlock()
+	if resetTimer {
+		select {
+		// reset timer 
+		case rf.heartbeatCh <- struct{}{}:
+		default:
+		}
+	}
+	
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -731,9 +750,7 @@ func (rf *Raft) handleAppendEntries() {
 			go rf.sendSnapshot(i, &args, &reply)
 		} else {
 			// send logs
-			var prevLogTerm int 
-			prevLogTerm = rf.logs[previdx].Term
-
+			prevLogTerm := rf.logs[previdx].Term
 			lastLog := rf.getLastLog()
 			var entries []Log
 			if rf.nextIdx[i] <= lastLog.Index {
@@ -788,24 +805,21 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	resetTimer := false 
 	// implement rule 2 for all servers
 	updatePersist := rf.updateTermAndStateIfPossible(args.Term)
 	if rf.currentTerm == args.Term {
-		// reset timer
-		rf.heartbeatCh <- struct{}{}
+		resetTimer = true 
 		if rf.voteFor == -1 {
 			rf.voteFor = args.LeaderId
 			updatePersist = true
 		}
 		// first case, the snapshot is older than the one in the follower (unreliable network causing older snapshot arriving late)
 		if rf.snapshot != nil && rf.snapshot.LastIncludedIndex >= args.LastIncludedIndex {
-			if updatePersist {
-				rf.persist()
-			}
-			return 
+			goto RETURN
 		}
+		
 		lastLog := rf.getLastLog()
 		// all other cases, it will install snapshot
 		rf.snapshot = &SnapshotBody{Data: args.Data, LastIncludedIndex: args.LastIncludedIndex, LastIncludedTerm: args.LastIncludedTerm}
@@ -833,16 +847,29 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		data := make([]byte, len(rf.snapshot.Data))
 		copy(data, rf.snapshot.Data)
 		go func(snapshot []byte, lastIncludedIndex int, lastIncludedTerm int) {
-			rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}
+			select {
+			case rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}:
+			case <- rf.stopCh:
+				return
+			}
 		}(data, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm)
 
 		DPrintf("Follower %v update snapshot until index %v; shrink the log to length %v\n", rf.me, rf.snapshot.LastIncludedIndex, len(rf.logs))
 		
 	}
 
-	if updatePersist {
-		rf.persist()
-	}
+	RETURN:
+		if updatePersist {
+			rf.persist()
+		}
+		rf.mu.Unlock()
+		if resetTimer {
+			// reset timer and drop it if there is already a heartbeat
+			select {
+			case rf.heartbeatCh <- struct{}{}:
+			default:
+			}
+		}
 }
 
 
@@ -940,7 +967,12 @@ func (rf *Raft) createLogCopy(firstIndex, secondIndex int) []Log {
 
 func (rf *Raft) applyLogs(copyLogs []Log) {
 	for _, logItem := range copyLogs {
-		rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logItem.Command, CommandIndex: logItem.Index}
+		select {
+		case rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logItem.Command, CommandIndex: logItem.Index}:
+		case <- rf.stopCh:
+			return 
+		}
+		
 	}
 	rf.mu.Lock()
 	rf.lastApplied = copyLogs[len(copyLogs) - 1].Index
