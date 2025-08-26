@@ -54,7 +54,8 @@ type Raft struct {
 
 	// snapshot
 	snapshot *SnapshotBody
-	lastSnapshotIndex int 
+	// decide if we have a new snapshot to apply to the service
+	lastAppliedSnapshotIndex int 
 
 	// count how many acknowlage from peers, used when it is a candidate
 	votesCount int 
@@ -128,12 +129,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		log.Fatalf("log index %v different from snapshot index %v\n", logItem.Index, index)
 	}
 	rf.snapshot = &SnapshotBody{Data: snapshot, LastIncludedIndex: index, LastIncludedTerm: logItem.Term}
+	// update lastAppliedSnapshotIndex
+	rf.lastAppliedSnapshotIndex = index
 	// shrink the rf.logs, the last item in snapshot now becomes the sentinel
 	rf.shrinkLog("right", idx)
 	// update termLastEntry
 	rf.updateTermLastEntry()
 	rf.persist()
-	DPrintf("server %v create snapshot until index %v; shrink log to length %v\n", rf.me, index, len(rf.logs))
+	DPrintf("[goroutineId | %v]: server %v (state %v) create snapshot until index %v; shrink log to length %v\n", getGID(), rf.me, rf.state, index, len(rf.logs))
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -192,6 +195,10 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	if atomic.SwapInt32(&rf.dead, 1) == 0 {
         close(rf.stopCh)
+		// next 3 lines for debugging
+		// rf.mu.Lock()
+		// DPrintf("[goroutineId | %v]: server %v crashed with term %v, votefor %v, state %v\n", getGID(), rf.me, rf.currentTerm, rf.voteFor, rf.state)
+		// rf.mu.Unlock()
     }
 }
 
@@ -236,7 +243,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	DPrintf("server %v starts finish\n", rf.me)
+	// start applydaemon to apply logs
+	go rf.applyDaemon()
+	DPrintf("[goroutineId | %v]: server %v starts finish\n", getGID(), rf.me)
 
 	return rf
 }
@@ -285,14 +294,6 @@ func (rf *Raft) persist() {
 		e.Encode(rf.snapshot.LastIncludedIndex)
 		e.Encode(rf.snapshot.LastIncludedTerm)
 		snapshot = rf.snapshot.Data
-		// for debug
-		if rf.snapshot.LastIncludedIndex > rf.lastSnapshotIndex {
-			rf.lastSnapshotIndex = rf.snapshot.LastIncludedIndex
-			DPrintf("server %v updates snapshot(index %v | term %v | size %v]) in persistence\n", rf.me, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm, len(snapshot))
-		} else {
-			DPrintf("server %v keeps snapshot(index %v | term %v | size %v]) in persistence\n", rf.me, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm, len(snapshot))
-		}
-		
 	}
 
 	raftState := w.Bytes()
@@ -319,7 +320,8 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
-	
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// only called once before server is ready to provide service, so no need lock
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -354,17 +356,16 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.snapshot = &SnapshotBody{Data: snapshot, LastIncludedIndex: lastIncludedIndex, LastIncludedTerm: lastincludedTerm}
 		// set commitIdx to lastIncludedIndex 
 		rf.commitedIdx = lastIncludedIndex
-		
-		DPrintf("server %v loads snapshot with index %v and term %v, size %v\n", rf.me, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm, len(snapshot))
+		// update last applied
+		rf.lastApplied = lastIncludedIndex
+		// update lastappliedindex because the tester will apply snapshot to the service
+		rf.lastAppliedSnapshotIndex = lastIncludedIndex
+
+		DPrintf("[goroutineId | %v]: server %v restarts with term %v and votefor %v; loads snapshot with index %v and term %v, size %v\n", getGID(), rf.me, rf.currentTerm, rf.voteFor, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm, len(snapshot))
 		// DPrintf("server %v's snapshot data: %v", rf.me, rf.snapshot.Data)
 	} else {
-		DPrintf("server %v no snapshots(snapshot size %v)\n", rf.me, rf.persister.SnapshotSize())
+		DPrintf("[goroutineId | %v]: server %v no snapshots(snapshot size %v)\n", getGID(), rf.me, rf.persister.SnapshotSize())
 	}
-
-	// for debug 
-	DPrintf("Server %v loads logs length %v \n", rf.me, len(rf.logs))
-	
-	DPrintf("Server %v read persistence done\n", rf.me)
 }
 
 /*
@@ -467,6 +468,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		// another guard point to avoid handling outdated request
+		if rf.currentTerm != args.Term || rf.state != Candidate {
+			return ok
+		}
 		// if more than a half votegranted, rf.state will be leader 
 		// if it is a outdated leader, rf.state will be changed back to follower
 		// thus, only need to process while it is still a candidate
@@ -474,7 +479,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		updatePersist := rf.updateTermAndStateIfPossible(reply.Term)
 		if rf.state == Candidate {
 			if reply.VoteGranted {
-				DPrintf("Candidate %v receives vote from server %v\n", rf.me, server)
+				DPrintf("[goroutineId | %v]: Candidate %v receives vote from server %v\n", getGID(), rf.me, server)
 				rf.votesCount++
 				majority := len(rf.peers) / 2 + 1
 				if rf.votesCount + 1 >= majority {
@@ -502,13 +507,13 @@ func (rf *Raft) leaderInit() {
 	}
 	// start heartbeats goroutine
 	go rf.syncup()
-	DPrintf("%v becomes a leader\n", rf.me)
+	DPrintf("[goroutineId | %v]: %v becomes a leader\n", getGID(), rf.me)
 }
 
 func (rf *Raft) handleLeaderSelection() {
 	// start leader electtion 
 	// when we call this function, default is the lock is acquired
-	DPrintf("%v start a new term(%v) to be a candidate", rf.me, rf.currentTerm + 1)
+	DPrintf("[goroutineId | %v]: %v start a new term(%v) from state %v to be a candidate\n", getGID(), rf.me, rf.currentTerm + 1, rf.state)
 	rf.currentTerm++
 	rf.voteFor = rf.me 
 	rf.state = Candidate
@@ -539,11 +544,13 @@ func (rf *Raft) ticker() {
 	ms := 600 + (rand.Int63() % 600)
 	timer := time.NewTimer(time.Duration(ms) * time.Millisecond)
 
-	for !rf.killed() {
+	for {
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		// ms := 50 + (rand.Int63() % 300)
 		select {
+		case <- rf.stopCh:
+			return 
 		case <- timer.C:
 			rf.mu.Lock()
 			if rf.state != Leader {
@@ -594,17 +601,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term == rf.currentTerm {
 		resetTimer = true 
 		// fix those who transformed from candidate or expired leader in rf.UpdateTermAndStateIfPossible
-		if rf.voteFor == -1 {
+		if rf.voteFor != args.LeaderId {
 			rf.voteFor = args.LeaderId
+			rf.state = Follower
+			rf.votesCount = -1
 			updatePersist = true
 		}
 		// since the term of follower doesn't conflict with the requested leader, we set the XLen to the logs length
 		lastLog := rf.getLastLog()
+		// apply index transformation
+		idx := rf.indexToInd(args.PrevLogIdx)
+		// debug
+		if idx < 0 {
+			log.Fatalf("follower %v receives a request that compare packets before snapshots; current snapshot lastincludedindex %v, args.PrevLogIdx %v\n", rf.me, rf.snapshot.LastIncludedIndex, args.PrevLogIdx)
+		}
 		reply.XLen = lastLog.Index + 1
-		// compare prevLogIdx and prevLogTerm
 		if lastLog.Index >= args.PrevLogIdx {
-			// apply index transformation 
-			idx := rf.indexToInd(args.PrevLogIdx)
 			prevLog := rf.logs[idx]
 			if prevLog.Term == args.PrevLogTerm {
 				// set reply to be successful
@@ -615,9 +627,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					// rf.logs = append(rf.logs, args.Entries...)
 
 					// DPrintf("Follower %v get logs from %v to %v\n", rf.me, args.Entries[0].Index, args.Entries[len(args.Entries) - 1].Index)
+
 					// add new logs and update last entry of terms
-					rf.shrinkLog("left", idx + 1)
-					rf.logs = append(rf.logs, args.Entries...)
+					// shouldn't trim the logs directly in case it is an older request from the same leader but with shorter entries
+					// rf.shrinkLog("left", idx + 1)
+					i := 0
+					for ; i + idx + 1 < len(rf.logs) && i < len(args.Entries); i++ {
+						if rf.logs[i + idx + 1].Term == args.Entries[i].Term {
+							continue 
+						} 
+						rf.shrinkLog("left", i + idx + 1)
+						break
+					}
+					rf.logs = append(rf.logs, args.Entries[i:]...)
+					// DPrintf("[goroutineId | %v]: server %v rf.logs: %v; added args.Entries %v\n", getGID(), rf.me, rf.logs, args.Entries[i:])
+					// DPrintf("[goroutineId | %v]: server %v updates logs from %v to %v\n", getGID(), rf.me, i, len(rf.logs) - 1)
 					rf.updateTermLastEntry()
 					updatePersist = true 
 				}
@@ -626,10 +650,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					lastCommitedIdx := rf.commitedIdx
 					rf.commitedIdx = min(lastLog.Index, args.LeaderCommit)
 					DPrintf("Follower %v updates commitedIdx from %v to %v at term %v\n", rf.me, lastCommitedIdx, rf.commitedIdx, rf.currentTerm)
-
-					// prepare to apply logs to applyCh
-					copyLogs := rf.createLogCopy(lastCommitedIdx + 1, rf.commitedIdx)
-					go rf.applyLogs(copyLogs)
 				}
 			} else {
 				term := prevLog.Term
@@ -642,13 +662,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					}
 				}
 				reply.XIndex = rf.logs[rf.termLastEntry[lastTerm]].Index + 1
-				
-				DPrintf("AppendEntries Failed from Leader %v; Follower %v return first index %v of the conflict term %v\n", args.LeaderId, rf.me, reply.XIndex, term)
+				// DPrintf("[goroutineId | %v]: server %v rejects with lastTerm %v, and logs %v\n", getGID(), rf.me, lastTerm, rf.logs)
 			}
 		}
-		if updatePersist {
-			rf.persist()
-		}
+	}
+	if updatePersist {
+		rf.persist()
+	}
+	// debug
+	if !reply.Success {
+		DPrintf("[goroutineId | %v]: AppendEntries Failed from Leader %v (term %v) of previndex %v, prevterm %v; Follower %v returns XLen %v, XTerm %v, XIndex %v; follower last log index %v\n", getGID(), args.LeaderId, args.Term, args.PrevLogIdx, args.PrevLogTerm, rf.me, reply.XLen, reply.XTerm, reply.XIndex, rf.getLastLog().Index)
 	}
 	rf.mu.Unlock()
 	if resetTimer {
@@ -666,40 +689,53 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		// guard point to avoid processing outdated response
+		if rf.currentTerm != args.Term || rf.state != Leader {
+			return ok
+		}
 		updatePersist := rf.updateTermAndStateIfPossible(reply.Term)
 		if rf.state == Leader {
 			// handle response
 			if reply.Success {
 				// update matchIdx, be careful that the leader might accept client requests at the same time
-				if len(args.Entries) > 0 {
-					lastEntry := args.Entries[len(args.Entries) - 1]
-					matchIdx := lastEntry.Index
+				matchIdx := args.PrevLogIdx + len(args.Entries)
+				nextIdx := matchIdx + 1
+
+				if matchIdx > rf.matchIdx[server] {
 					rf.matchIdx[server] = matchIdx
-					rf.nextIdx[server] = matchIdx + 1
-					// update the commitIndex if the log is in current term
-					if rf.commitedIdx < matchIdx && lastEntry.Term == rf.currentTerm {
-						replicateCnt := 0
-						majority := len(rf.peers) / 2 + 1
-						for i := range rf.matchIdx {
-							if i == rf.me {
-								continue
-							}
-							if rf.matchIdx[i] >= matchIdx {
-								replicateCnt++
-								// more than a half agree, break
-								if replicateCnt + 1 >= majority {
-									break
-								}
+					rf.nextIdx[server] = nextIdx
+				}
+
+				// for debug
+				var lastEntry Log
+				if len(args.Entries) > 0 {
+					lastEntry = args.Entries[len(args.Entries) - 1]
+				} else {
+					lastEntry = *rf.getLastLog()
+				}
+				// DPrintf("[goroutineId | %v]: Request successful update follower %v nextIdx to be %v and last entry: %v; leader logs: %v\n", getGID(), server, matchIdx + 1, lastEntry, rf.logs)
+				DPrintf("[goroutineId | %v]: Request successful update follower %v nextIdx to be %v and last entry: %v; leader logs length: %v\n", getGID(), server, matchIdx + 1, lastEntry, len(rf.logs))
+				// update the commitIndex if the log is in current term
+				if rf.commitedIdx < matchIdx && rf.logs[rf.indexToInd(matchIdx)].Term == rf.currentTerm {
+					replicateCnt := 0
+					majority := len(rf.peers) / 2 + 1
+					for i := range rf.matchIdx {
+						if i == rf.me {
+							continue
+						}
+						if rf.matchIdx[i] >= matchIdx {
+							replicateCnt++
+							// more than a half agree, break
+							if replicateCnt + 1 >= majority {
+								break
 							}
 						}
-						// increate commitedIdx
-						if replicateCnt + 1 >= majority {
-							lastCommited := rf.commitedIdx
-							rf.commitedIdx = matchIdx
-							DPrintf("Leader %v updates commitedIdx from %v to %v at term %v\n", rf.me, lastCommited, rf.commitedIdx, rf.currentTerm)
-							copyLogs := rf.createLogCopy(lastCommited + 1, rf.commitedIdx)
-							go rf.applyLogs(copyLogs)
-						}
+					}
+					// increate commitedIdx
+					if replicateCnt + 1 >= majority {
+						lastCommited := rf.commitedIdx
+						rf.commitedIdx = matchIdx
+						DPrintf("Leader %v updates commitedIdx from %v to %v at term %v\n", rf.me, lastCommited, rf.commitedIdx, rf.currentTerm)
 					}
 				}
 			} else {
@@ -710,10 +746,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 						rf.nextIdx[server] = reply.XIndex
 					}
 				} else if reply.XLen > 0 {
+					DPrintf("[goroutineId | %v]: Before update: nextIdx[%d]=%d, reply.XLen=%d", getGID(), server, rf.nextIdx[server], reply.XLen)
 					rf.nextIdx[server] = reply.XLen
 				} else {
 					// network partision or conjection leading to late response
-					DPrintf("Follower %v(term %v)'s XLen %v, XTerm %v XIndex %v rejects leader request because of term. Don't update anything and just retry", server, reply.Term, reply.XLen, reply.XTerm, reply.XIndex)
+					DPrintf("[goroutineId | %v]: Follower %v(term %v)'s XLen %v, XTerm %v XIndex %v rejects leader request because of term. Don't update anything and just retry", getGID(), server, reply.Term, reply.XLen, reply.XTerm, reply.XIndex)
 				}
 			}
 		}
@@ -749,6 +786,10 @@ func (rf *Raft) handleAppendEntries() {
 			reply := InstallSnapshotReply{}
 			go rf.sendSnapshot(i, &args, &reply)
 		} else {
+			// debug 
+			if previdx > len(rf.logs) {
+				log.Fatalf("previdx for follower %v (index %v) is more than logs length: %v; snapshot index %v; logs: %v,\n", i, previdx, len(rf.logs), rf.snapshot.LastIncludedIndex, rf.logs)
+			}
 			// send logs
 			prevLogTerm := rf.logs[previdx].Term
 			lastLog := rf.getLastLog()
@@ -756,6 +797,9 @@ func (rf *Raft) handleAppendEntries() {
 			if rf.nextIdx[i] <= lastLog.Index {
 				// When the server is a outdated leader and the real leader call us,
 				// it might change rf.logs during the gob encoding time(ok := rf.peers[server].Call("Raft.AppendEntries", args, reply))
+				if previdx == rf.getLastLog().Index  {
+					DPrintf("[goroutineId | %v]: leader %v send empty heartbeats; and len(rf.logs[predidx+1])=%v\n", getGID(), rf.me, len(rf.logs[previdx+1:]))
+				}
 				entries = make([]Log, len(rf.logs[previdx+1:]))
 				copy(entries, rf.logs[previdx+1:])
 			}
@@ -776,8 +820,11 @@ func (rf *Raft) handleAppendEntries() {
 
 func (rf *Raft) syncup() {
 	ms := 100
-	for !rf.killed() {
-		<- time.After(time.Duration(ms) * time.Millisecond)
+	for {
+		select {
+		case <- rf.stopCh:
+			return 
+		case <- time.After(time.Duration(ms) * time.Millisecond):
 		rf.mu.Lock()
 		if rf.state != Leader {
 			rf.mu.Unlock()
@@ -785,6 +832,7 @@ func (rf *Raft) syncup() {
 		}
 		rf.handleAppendEntries()
 		rf.mu.Unlock()
+		}
 	}
 }
 
@@ -817,19 +865,26 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		}
 		// first case, the snapshot is older than the one in the follower (unreliable network causing older snapshot arriving late)
 		if rf.snapshot != nil && rf.snapshot.LastIncludedIndex >= args.LastIncludedIndex {
+			DPrintf("Follower %v receive a snapshot with smaller includedIndex %v than its current ones %v\n", rf.me, args.LastIncludedIndex, rf.snapshot.LastIncludedIndex)
 			goto RETURN
 		}
-		
+		DPrintf("Follower %v receive a snapshot with includedIndex %v from leader %v\n", rf.me, args.LastIncludedIndex, args.LeaderId)
 		lastLog := rf.getLastLog()
-		// all other cases, it will install snapshot
+
+		// all other cases, it will install snapshot and trim the logs
+		// be careful to apply indexToInd before updating the snapshot, because indexToInd relies on snapshot
+		idx := rf.indexToInd(args.LastIncludedIndex)
 		rf.snapshot = &SnapshotBody{Data: args.Data, LastIncludedIndex: args.LastIncludedIndex, LastIncludedTerm: args.LastIncludedTerm}
 		updatePersist = true 
+
 		// second case, the snapshot is ahead of logs; remove the whole rf.logs (here we add a sentinel log)
 		if args.LastIncludedIndex > lastLog.Index {
 			rf.logs = []Log{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}
-		} else if snapshotLog := rf.logs[rf.indexToInd(args.LastIncludedIndex)]; snapshotLog.Term == args.LastIncludedTerm {
+		} else if snapshotLog := rf.logs[idx]; snapshotLog.Term == args.LastIncludedTerm {
 			// third case, the snapshot is prefix of the rf.logs
-			rf.shrinkLog("right", rf.indexToInd(args.LastIncludedIndex))
+			DPrintf("[goroutineId | %v]: server %v trim logs to tails from startidx %v from to the end %v\n", getGID(), rf.me, idx, len(rf.logs) - 1)
+			rf.shrinkLog("right", idx)
+			
 		} else {
 			// fourth case, the snapshot conflicts with the rf.logs; remove the whole rf.logs (here we add a sentinel log)
 			rf.logs = []Log{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}
@@ -839,22 +894,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		// update commitIndex
 		if rf.snapshot.LastIncludedIndex > rf.commitedIdx {
 			rf.commitedIdx = rf.snapshot.LastIncludedIndex	
-		} else if rf.snapshot.LastIncludedIndex < rf.commitedIdx {
-			// for debug 
-			DPrintf("Follower %v update snapshot at index %v but commitedIdx is at %v\n", rf.me, rf.snapshot.LastIncludedIndex, rf.commitedIdx)
 		}
-		// apply snapshot
-		data := make([]byte, len(rf.snapshot.Data))
-		copy(data, rf.snapshot.Data)
-		go func(snapshot []byte, lastIncludedIndex int, lastIncludedTerm int) {
-			select {
-			case rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}:
-			case <- rf.stopCh:
-				return
-			}
-		}(data, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm)
-
-		DPrintf("Follower %v update snapshot until index %v; shrink the log to length %v\n", rf.me, rf.snapshot.LastIncludedIndex, len(rf.logs))
 		
 	}
 
@@ -878,10 +918,14 @@ func (rf *Raft) sendSnapshot(server int, args *InstallSnapshotArgs, reply *Insta
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		// guard point to avoid processing outdated response
+		if rf.currentTerm != args.Term || rf.state != Leader {
+			return ok
+		}
 		updatePersist := rf.updateTermAndStateIfPossible(reply.Term)
 		if rf.state == Leader {
 			matchIdx := args.LastIncludedIndex
-			rf.matchIdx[server] = args.LastIncludedIndex
+			rf.matchIdx[server] = matchIdx
 			rf.nextIdx[server] = matchIdx + 1
 		}
 		if updatePersist {
@@ -953,28 +997,47 @@ func (rf *Raft) updateTermLastEntry() {
 	rf.termLastEntry = newTermLastEntry
 }
 
-
-func (rf *Raft) createLogCopy(firstIndex, secondIndex int) []Log {
-	// include both ends
-	// lock is acquired
-	copyLogs := make([]Log, secondIndex - firstIndex + 1)
-	sidx, eidx := rf.indexToInd(firstIndex), rf.indexToInd(secondIndex)
-	copy(copyLogs, rf.logs[sidx:eidx+1])
-	// DPrintf("server %v try to create logs copy from %v to %v in rf.logs\n", rf.me, sidx, eidx)
-	return copyLogs
-}
-
-
-func (rf *Raft) applyLogs(copyLogs []Log) {
-	for _, logItem := range copyLogs {
+func (rf *Raft) applyDaemon() {
+	ms := time.Duration(10) * time.Millisecond
+	for {
 		select {
-		case rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logItem.Command, CommandIndex: logItem.Index}:
 		case <- rf.stopCh:
 			return 
+		case <- time.After(ms):
+			var snapshot []byte
+			lastIncludedIndex := -1
+			lastIncludedTerm := -1
+			rf.mu.Lock()
+			if rf.snapshot != nil && rf.lastAppliedSnapshotIndex < rf.snapshot.LastIncludedIndex {
+				lastIncludedIndex = rf.snapshot.LastIncludedIndex
+				lastIncludedTerm = rf.snapshot.LastIncludedTerm
+				snapshot = make([]byte, len(rf.snapshot.Data))
+				copy(snapshot, rf.snapshot.Data)
+				rf.lastAppliedSnapshotIndex = rf.snapshot.LastIncludedIndex
+			}
+			rf.mu.Unlock()
+			if len(snapshot) > 0 {
+				rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}
+			}
+
+			var copyLogs []Log
+			rf.mu.Lock()
+			if rf.lastApplied < rf.commitedIdx {
+				sidx := rf.lastApplied + 1
+				if rf.snapshot != nil {
+					sidx = max(sidx, rf.snapshot.LastIncludedIndex + 1)
+				} 
+				if sidx <= rf.commitedIdx {
+					copyLogs = make([]Log, rf.commitedIdx - sidx + 1)
+					sidx, eidx := rf.indexToInd(sidx), rf.indexToInd(rf.commitedIdx)
+					copy(copyLogs, rf.logs[sidx:eidx+1])
+				}
+				rf.lastApplied = rf.commitedIdx
+			}
+			rf.mu.Unlock()
+			for _, logItem := range copyLogs {
+				rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logItem.Command, CommandIndex: logItem.Index}
+			}
 		}
-		
 	}
-	rf.mu.Lock()
-	rf.lastApplied = copyLogs[len(copyLogs) - 1].Index
-	rf.mu.Unlock()
 }
