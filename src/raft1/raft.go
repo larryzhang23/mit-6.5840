@@ -195,10 +195,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	if atomic.SwapInt32(&rf.dead, 1) == 0 {
         close(rf.stopCh)
-		// next 3 lines for debugging
-		// rf.mu.Lock()
-		// DPrintf("[goroutineId | %v]: server %v crashed with term %v, votefor %v, state %v\n", getGID(), rf.me, rf.currentTerm, rf.voteFor, rf.state)
-		// rf.mu.Unlock()
+		close(rf.applyCh)
     }
 }
 
