@@ -63,6 +63,8 @@ type Raft struct {
 	termLastEntry map[int]int
 	// heartbeat channel
 	heartbeatCh chan struct{}
+	// replicate log after receiving request from client
+	sendLogCh chan struct{}
 	// A channel to inform short time running goroutine the server is closed
 	stopCh chan struct{}
 }
@@ -162,10 +164,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false 
 	}
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	// handle the case the server is not the leader 
 	term = rf.currentTerm
 	if rf.state != Leader {
+		rf.mu.Unlock()
 		return index, term, false
 	} 
 	// start the agreement service 
@@ -177,6 +179,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.termLastEntry[term] = len(rf.logs) - 1
 	// update persist
 	rf.persist()
+	rf.mu.Unlock()
+	// send logs to peers
+	rf.sendLogCh <- struct{}{}
 
 	return index, term, isLeader
 }
@@ -195,7 +200,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	if atomic.SwapInt32(&rf.dead, 1) == 0 {
         close(rf.stopCh)
-		close(rf.applyCh)
+		// don't close applyCh here
     }
 }
 
@@ -228,6 +233,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = append(rf.logs, Log{Term: rf.currentTerm, Index: 0})
 	// initialize heartbeat channel
 	rf.heartbeatCh = make(chan struct{}, 1)
+	// initialize the sendLog channel 
+	rf.sendLogCh = make(chan struct{})
 	rf.stopCh = make(chan struct{})
 
 	for range peers {
@@ -590,10 +597,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	lastLog := rf.getLastLog()
 	// apply index transformation
 	idx := rf.indexToInd(args.PrevLogIdx)
-	// debug
+	// handle the out-of-order and delayed request
 	if idx < 0 {
-		log.Fatalf("follower %v receives a request that compare packets before snapshots; current snapshot lastincludedindex %v, args.PrevLogIdx %v\n", rf.me, rf.snapshot.LastIncludedIndex, args.PrevLogIdx)
+		DPrintf("follower %v receives a request that compare packets before snapshots; current snapshot lastincludedindex %v, args.PrevLogIdx %v\n", rf.me, rf.snapshot.LastIncludedIndex, args.PrevLogIdx)
+		// trim the args.Entries to start after rf.snapshot.
+		// debug
+		if -idx - 1 < len(args.Entries) && args.Entries[-idx - 1].Term != rf.snapshot.LastIncludedTerm {
+			log.Fatalf("Leader %v packet at index %v has term %v different from snapshot lastincludedindex %v's term %v\n", args.LeaderId, args.Entries[-idx-1].Index, args.Entries[-idx-1].Term, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm)
+		}
+		args.PrevLogIdx = rf.snapshot.LastIncludedIndex
+		args.PrevLogTerm = rf.snapshot.LastIncludedTerm
+		trimIdx := min(-idx, len(args.Entries))
+		args.Entries = args.Entries[trimIdx:]
+		idx = 0
 	}
+
 	// set XLen to the length of current log so that the leader knows
 	reply.XLen = lastLog.Index + 1
 	if lastLog.Index >= args.PrevLogIdx {
@@ -730,6 +748,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 
 func (rf *Raft) handleAppendEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != Leader {
+		return 
+	}
 	// assuem lock is acuired when the function is called
 	for i := range rf.peers {
 		if i == rf.me {
@@ -912,20 +935,18 @@ func (rf *Raft) leaderDaemon() {
 	for {
 		select {
 		case <- rf.stopCh:
-			return 
-		case <- time.After(time.Duration(ms) * time.Millisecond):
-		rf.mu.Lock()
-		if rf.state != Leader {
-			rf.mu.Unlock()
-			return 
-		}
+		return 
+		// to replicate logs from user request right away
+		case <- rf.sendLogCh:
 		rf.handleAppendEntries()
-		rf.mu.Unlock()
+		case <- time.After(time.Duration(ms) * time.Millisecond):
+		rf.handleAppendEntries()
 		}
 	}
 }
 
 func (rf *Raft) applyDaemon() {
+	defer close(rf.applyCh)
 	ms := time.Duration(10) * time.Millisecond
 	for {
 		select {
