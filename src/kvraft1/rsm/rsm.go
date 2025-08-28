@@ -1,14 +1,17 @@
 package rsm
 
 import (
+	//"log"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
@@ -18,6 +21,8 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Id string
+	Req any
 }
 
 
@@ -41,6 +46,7 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	results map[string]any
 }
 
 // servers[] contains the ports of the set of
@@ -68,6 +74,8 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	rsm.results = make(map[string]any)
+	go rsm.reader()
 	return rsm
 }
 
@@ -86,5 +94,55 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	op := Op{Id: uuid.NewString(), Req: req}
+	
+	_, _, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	}
+	ms := time.Duration(10) * time.Millisecond
+	
+	var result any
+	for {
+		rsm.mu.Lock()
+		// check if the raft service is shutdown
+		if _, ok := rsm.results["shutdown"]; ok {
+			rsm.mu.Unlock()
+			return rpc.ErrWrongLeader, nil
+		}
+		if val, ok := rsm.results[op.Id]; ok {
+			result = val
+			rsm.mu.Unlock()
+			break
+		}
+		// detect if the leadership is changed
+		_, isLeader := rsm.rf.GetState()
+		rsm.mu.Unlock()
+		if !isLeader {
+			return rpc.ErrWrongLeader, nil
+		}
+		
+		time.Sleep(ms)
+	}
+
+	return rpc.OK, result
+	
+}
+
+
+func (rsm *RSM) reader() {
+	for m := range rsm.applyCh {
+		if m.CommandValid {
+			command := m.Command.(Op)
+			result := rsm.sm.DoOp(command.Req)
+			rsm.mu.Lock()
+			rsm.results[command.Id] = result
+			rsm.mu.Unlock()
+		}
+	}
+	// told the Submit goroutine the service is shutdown
+	rsm.mu.Lock()
+	rsm.results["shutdown"] = true 
+	rsm.mu.Unlock()
+	
 }
