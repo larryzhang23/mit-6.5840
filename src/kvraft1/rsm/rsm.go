@@ -1,7 +1,8 @@
 package rsm
 
 import (
-	//"log"
+	"bytes"
+	"log"
 	"sync"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
+	"6.5840/labgob"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -23,6 +25,11 @@ type Op struct {
 	// otherwise RPC will break.
 	Id string
 	Req any
+}
+
+type SnapshotWithIndex struct {
+	Snapshot []byte 
+	LastIncludedIndex int
 }
 
 
@@ -47,6 +54,12 @@ type RSM struct {
 	sm           StateMachine
 	// Your definitions here.
 	results map[string]any
+	// a channel to tell stuck submit request that the raft service is shutdown
+	stopCh chan struct{}
+	// largest log index, tracing for snapshot
+	appliedIndex int
+	// last snapshot index
+	snapshotIndex int 
 }
 
 // servers[] contains the ports of the set of
@@ -74,8 +87,21 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	if persister.SnapshotSize() > 0 {
+		snapshotData := persister.ReadSnapshot()
+		snapshotWithIndex := rsm.decodeSnapshot(snapshotData)
+		// log.Printf("server %v restores snapshot at index %v with size %v and current state size is %v\n", rsm.me, snapshotWithIndex.LastIncludedIndex, persister.SnapshotSize(), persister.RaftStateSize())
+		rsm.sm.Restore(snapshotWithIndex.Snapshot)
+		rsm.appliedIndex = snapshotWithIndex.LastIncludedIndex
+		rsm.snapshotIndex = snapshotWithIndex.LastIncludedIndex
+	}
+
 	rsm.results = make(map[string]any)
+	rsm.stopCh = make(chan struct{})
 	go rsm.reader()
+	if rsm.maxraftstate > -1 {
+		go rsm.makeSnapshot()
+	}
 	return rsm
 }
 
@@ -95,8 +121,9 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 	// your code here
 	op := Op{Id: uuid.NewString(), Req: req}
-	
+
 	_, _, isLeader := rsm.rf.Start(op)
+
 	if !isLeader {
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
 	}
@@ -104,29 +131,24 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	
 	var result any
 	for {
-		rsm.mu.Lock()
-		// check if the raft service is shutdown
-		if _, ok := rsm.results["shutdown"]; ok {
-			rsm.mu.Unlock()
+		select {
+		case <- rsm.stopCh:
 			return rpc.ErrWrongLeader, nil
-		}
-		if val, ok := rsm.results[op.Id]; ok {
-			result = val
+		case <- time.After(ms):
+			rsm.mu.Lock()
+			if val, ok := rsm.results[op.Id]; ok {
+				result = val
+				rsm.mu.Unlock()
+				return rpc.OK, result
+			}
 			rsm.mu.Unlock()
-			break
+			// detect if the leadership is changed
+			_, isLeader := rsm.rf.GetState()
+			if !isLeader {
+				return rpc.ErrWrongLeader, nil
+			}
 		}
-		// detect if the leadership is changed
-		_, isLeader := rsm.rf.GetState()
-		rsm.mu.Unlock()
-		if !isLeader {
-			return rpc.ErrWrongLeader, nil
-		}
-		
-		time.Sleep(ms)
 	}
-
-	return rpc.OK, result
-	
 }
 
 
@@ -134,15 +156,76 @@ func (rsm *RSM) reader() {
 	for m := range rsm.applyCh {
 		if m.CommandValid {
 			command := m.Command.(Op)
-			result := rsm.sm.DoOp(command.Req)
 			rsm.mu.Lock()
+			result := rsm.sm.DoOp(command.Req)
+			// increase index
+			if m.CommandIndex < rsm.appliedIndex {
+				log.Panicf("commitIndex %v is smaller than applied index %v\n", m.CommandIndex, rsm.appliedIndex)
+			}
+			rsm.appliedIndex = m.CommandIndex
+			// log.Printf("server %v updates appliedIndex at %v, raft state size %v\n", rsm.me, rsm.appliedIndex, rsm.rf.PersistBytes())
 			rsm.results[command.Id] = result
+			rsm.mu.Unlock()
+		} else if m.SnapshotValid {
+			// log.Printf("server %v installs snapshot at index %v, term %v\n", rsm.me, m.SnapshotIndex, m.SnapshotTerm)
+			snapshotWithIndex := rsm.decodeSnapshot(m.Snapshot)
+			if snapshotWithIndex.LastIncludedIndex != m.SnapshotIndex {
+				log.Panicf("snapshot index in storage %v is different from the message snapshot index %v\n", snapshotWithIndex.LastIncludedIndex, m.SnapshotIndex)
+			}
+			rsm.mu.Lock()
+			// message might be delayed, so the snapshot in the message is earlier than the one rsm created, in this case skip the snapshot
+			if rsm.snapshotIndex >= m.SnapshotIndex {
+				// log.Panicf("rsm last snapshot index %v is larger than message snapshot index %v\n", rsm.snapshotIndex, m.SnapshotIndex)
+				rsm.mu.Unlock()
+				continue
+			}
+			rsm.sm.Restore(snapshotWithIndex.Snapshot)
+			if m.SnapshotIndex > rsm.appliedIndex {
+				rsm.appliedIndex = m.SnapshotIndex
+			}
 			rsm.mu.Unlock()
 		}
 	}
-	// told the Submit goroutine the service is shutdown
-	rsm.mu.Lock()
-	rsm.results["shutdown"] = true 
-	rsm.mu.Unlock()
-	
+	close(rsm.stopCh)
+}
+
+func (rsm *RSM) makeSnapshot() {
+	ms := time.Duration(10) * time.Millisecond
+	for {
+		select {
+		case <- rsm.stopCh:
+			return
+		case <- time.After(ms):
+			rsm.mu.Lock()
+			if rsm.appliedIndex > 0 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
+				snapshot := rsm.sm.Snapshot()
+				snapshotWithIndex := rsm.encodeSnapshot(snapshot)
+				if rsm.appliedIndex == 0 {
+					log.Panicf("server %v appliedIndex is 0;try to snapshot; and the raft state size is %v", rsm.me, rsm.rf.PersistBytes())
+				}
+				rsm.rf.Snapshot(rsm.appliedIndex, snapshotWithIndex)
+				// log.Printf("server %v creating snapshot at appliedIndex %v with afterwards raft state size %v\n", rsm.me, rsm.appliedIndex, rsm.rf.PersistBytes())
+				rsm.snapshotIndex = rsm.appliedIndex
+			}
+			rsm.mu.Unlock()
+		}
+	}
+}
+
+func (rsm *RSM) encodeSnapshot(snapshot []byte) []byte {
+	// lock acquired when called
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	snapshotWithIndex := SnapshotWithIndex{Snapshot: snapshot, LastIncludedIndex: rsm.appliedIndex}
+	e.Encode(snapshotWithIndex)
+	return w.Bytes()
+}
+
+func (rsm *RSM) decodeSnapshot(snapshotWithIndexData []byte) *SnapshotWithIndex {
+	// lock acquired when called
+	r := bytes.NewBuffer(snapshotWithIndexData)
+	d := labgob.NewDecoder(r)
+	var snapshotWithIndex SnapshotWithIndex
+	d.Decode(&snapshotWithIndex)
+	return &snapshotWithIndex
 }

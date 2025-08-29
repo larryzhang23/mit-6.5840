@@ -34,7 +34,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
 	reply := rpc.GetReply{}
-	ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply); 
+	ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
 	for !ok {
 		time.Sleep(100 * time.Millisecond)
 		ok = ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)

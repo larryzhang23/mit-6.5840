@@ -63,8 +63,6 @@ type Raft struct {
 	termLastEntry map[int]int
 	// heartbeat channel
 	heartbeatCh chan struct{}
-	// replicate log after receiving request from client
-	sendLogCh chan struct{}
 	// A channel to inform short time running goroutine the server is closed
 	stopCh chan struct{}
 }
@@ -124,7 +122,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	// log.Printf("RAFT server %v's first index in logs: %v and the snapshot index is %v\n", rf.me, rf.logs[0].Index, index)
 	idx := rf.indexToInd(index)
+	// it is possible that the server is creating a snapshot older than the raft has and raft's applyCh hasn't been executaed by the server
+	// in this case, skip the snapshot
+	if idx <= 0 {
+		return 
+	}
 	logItem := rf.logs[idx]
 	// for debug
 	if logItem.Index != index {
@@ -160,6 +164,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 	// handle the case the server is killed 
+	// the server is still possibly killed after this check, so don't apply any case that is long-running or blocked
 	if rf.killed() {
 		return index, term, false 
 	}
@@ -181,7 +186,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	rf.mu.Unlock()
 	// send logs to peers
-	rf.sendLogCh <- struct{}{}
+	rf.handleAppendEntries()
 
 	return index, term, isLeader
 }
@@ -233,8 +238,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = append(rf.logs, Log{Term: rf.currentTerm, Index: 0})
 	// initialize heartbeat channel
 	rf.heartbeatCh = make(chan struct{}, 1)
-	// initialize the sendLog channel 
-	rf.sendLogCh = make(chan struct{})
 	rf.stopCh = make(chan struct{})
 
 	for range peers {
@@ -935,12 +938,9 @@ func (rf *Raft) leaderDaemon() {
 	for {
 		select {
 		case <- rf.stopCh:
-		return 
-		// to replicate logs from user request right away
-		case <- rf.sendLogCh:
-		rf.handleAppendEntries()
+			return 
 		case <- time.After(time.Duration(ms) * time.Millisecond):
-		rf.handleAppendEntries()
+			rf.handleAppendEntries()
 		}
 	}
 }
