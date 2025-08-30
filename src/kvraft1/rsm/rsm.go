@@ -174,15 +174,11 @@ func (rsm *RSM) reader() {
 			}
 			rsm.mu.Lock()
 			// message might be delayed, so the snapshot in the message is earlier than the one rsm created, in this case skip the snapshot
-			if rsm.snapshotIndex >= m.SnapshotIndex {
-				// log.Panicf("rsm last snapshot index %v is larger than message snapshot index %v\n", rsm.snapshotIndex, m.SnapshotIndex)
-				rsm.mu.Unlock()
-				continue
+			if rsm.appliedIndex >= m.SnapshotIndex {
+				log.Panicf("rsm last snapshot index %v is larger than message snapshot index %v\n", rsm.snapshotIndex, m.SnapshotIndex)
 			}
 			rsm.sm.Restore(snapshotWithIndex.Snapshot)
-			if m.SnapshotIndex > rsm.appliedIndex {
-				rsm.appliedIndex = m.SnapshotIndex
-			}
+			rsm.appliedIndex = m.SnapshotIndex
 			rsm.mu.Unlock()
 		}
 	}
@@ -200,9 +196,6 @@ func (rsm *RSM) makeSnapshot() {
 			if rsm.appliedIndex > 0 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
 				snapshot := rsm.sm.Snapshot()
 				snapshotWithIndex := rsm.encodeSnapshot(snapshot)
-				if rsm.appliedIndex == 0 {
-					log.Panicf("server %v appliedIndex is 0;try to snapshot; and the raft state size is %v", rsm.me, rsm.rf.PersistBytes())
-				}
 				rsm.rf.Snapshot(rsm.appliedIndex, snapshotWithIndex)
 				// log.Printf("server %v creating snapshot at appliedIndex %v with afterwards raft state size %v\n", rsm.me, rsm.appliedIndex, rsm.rf.PersistBytes())
 				rsm.snapshotIndex = rsm.appliedIndex

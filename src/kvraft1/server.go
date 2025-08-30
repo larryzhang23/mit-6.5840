@@ -166,7 +166,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	// labgob.Register(rpc.PutArgs{})
 	// labgob.Register(rpc.GetArgs{})
 	labgob.Register(Req{})
-	labgob.Register(KVServerValue{})
 
 	kv := &KVServer{me: me}
 	

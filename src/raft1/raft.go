@@ -54,8 +54,6 @@ type Raft struct {
 
 	// snapshot
 	snapshot *SnapshotBody
-	// decide if we have a new snapshot to apply to the service
-	lastAppliedSnapshotIndex int 
 
 	// count how many acknowlage from peers, used when it is a candidate
 	votesCount int 
@@ -135,8 +133,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		log.Fatalf("log index %v different from snapshot index %v\n", logItem.Index, index)
 	}
 	rf.snapshot = &SnapshotBody{Data: snapshot, LastIncludedIndex: index, LastIncludedTerm: logItem.Term}
-	// update lastAppliedSnapshotIndex
-	rf.lastAppliedSnapshotIndex = index
+
 	// shrink the rf.logs, the last item in snapshot now becomes the sentinel
 	rf.shrinkLog("right", idx)
 	// update termLastEntry
@@ -365,8 +362,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitedIdx = lastIncludedIndex
 		// update last applied
 		rf.lastApplied = lastIncludedIndex
-		// update lastappliedindex because the tester will apply snapshot to the service
-		rf.lastAppliedSnapshotIndex = lastIncludedIndex
 
 		DPrintf("[goroutineId | %v]: server %v restarts with term %v and votefor %v; loads snapshot with index %v and term %v, size %v\n", getGID(), rf.me, rf.currentTerm, rf.voteFor, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm, len(snapshot))
 		// DPrintf("server %v's snapshot data: %v", rf.me, rf.snapshot.Data)
@@ -957,20 +952,13 @@ func (rf *Raft) applyDaemon() {
 			lastIncludedIndex := -1
 			lastIncludedTerm := -1
 			rf.mu.Lock()
-			if rf.snapshot != nil && rf.lastAppliedSnapshotIndex < rf.snapshot.LastIncludedIndex {
+			if rf.snapshot != nil && rf.lastApplied < rf.snapshot.LastIncludedIndex {
 				lastIncludedIndex = rf.snapshot.LastIncludedIndex
 				lastIncludedTerm = rf.snapshot.LastIncludedTerm
 				snapshot = make([]byte, len(rf.snapshot.Data))
 				copy(snapshot, rf.snapshot.Data)
-				rf.lastAppliedSnapshotIndex = rf.snapshot.LastIncludedIndex
 			}
-			rf.mu.Unlock()
-			if len(snapshot) > 0 {
-				rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}
-			}
-
 			var copyLogs []Log
-			rf.mu.Lock()
 			if rf.lastApplied < rf.commitedIdx {
 				sidx := rf.lastApplied + 1
 				if rf.snapshot != nil {
@@ -981,11 +969,15 @@ func (rf *Raft) applyDaemon() {
 					sidx, eidx := rf.indexToInd(sidx), rf.indexToInd(rf.commitedIdx)
 					copy(copyLogs, rf.logs[sidx:eidx+1])
 				}
-				rf.lastApplied = rf.commitedIdx
 			}
 			rf.mu.Unlock()
+			if len(snapshot) > 0 {
+				rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}
+				rf.lastApplied = lastIncludedIndex
+			}
 			for _, logItem := range copyLogs {
 				rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logItem.Command, CommandIndex: logItem.Index}
+				rf.lastApplied = logItem.Index
 			}
 		}
 	}
