@@ -3,7 +3,6 @@ package kvraft
 import (
 	"time"
 	"sync"
-	// "log"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
@@ -58,18 +57,12 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			ok := ck.clnt.Call(server, "KVServer.Get", &args, &reply)
 			
 			if ok && reply.Err != rpc.ErrWrongLeader {
-				// log.Printf("server %v is the leader; update lastSeenLeader\n", server)
 				ck.mu.Lock()
 				ck.lastSeenLeader = idx
 				ck.mu.Unlock()
-				// log.Printf("err is %v\n", reply.Err)
 				return reply.Value, reply.Version, reply.Err
 			}
-			// if ok {
-			// 	log.Printf("server %v is not the leader; retry\n", server)
-			// }
 		}
-		// log.Println("sleep 100ms")
 		time.Sleep(100 * time.Millisecond)
 	}
 	// never reach here
@@ -103,10 +96,8 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	lastSeenLeader := ck.lastSeenLeader
 	ck.mu.Unlock() 
 	if lastSeenLeader != -1 {
-		// log.Printf("try old leader %v firstly\n", ck.servers[lastSeenLeader])
 		ok := ck.clnt.Call(ck.servers[lastSeenLeader], "KVServer.Put", &args, &reply)
 		if ok && reply.Err != rpc.ErrWrongLeader {
-			// log.Printf("err is %v\n", reply.Err)
 			return reply.Err
 		}
 		firstTimeSuccess = false 
@@ -119,22 +110,16 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 			ok := ck.clnt.Call(server, "KVServer.Put", &args, &reply)
 			// if it is not the wrong leader err, return directly
 			if ok && reply.Err != rpc.ErrWrongLeader {
-				// log.Printf("server %v is the leader; update lastSeenLeader\n", server)
 				ck.mu.Lock()
 				ck.lastSeenLeader = idx
 				ck.mu.Unlock()
-				// log.Printf("err is %v\n", reply.Err)
 				if !firstTimeSuccess && reply.Err == rpc.ErrVersion {
 					return rpc.ErrMaybe
 				} 
 				return reply.Err
 			} 
 			firstTimeSuccess = false 
-			// if ok {
-			// 	log.Printf("server %v is not the leader; retry\n", server)
-			// }
 		}
-		// log.Println("sleep 100ms")
 		time.Sleep(100 * time.Millisecond)
 	}
 	// never reach here

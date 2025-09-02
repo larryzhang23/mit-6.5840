@@ -1,9 +1,8 @@
 package kvraft
 
 import (
-	//"log"
-	"sync"
 	"bytes"
+	"sync"
 	"sync/atomic"
 
 	"6.5840/kvraft1/rsm"
@@ -54,7 +53,6 @@ func (kv *KVServer) DoOp(req any) any {
 			reply.Value = value 
 			reply.Version = version
 			reply.Err = rpc.OK
-			// log.Printf("server %v retrives from kvstore %v with [k,v] [%v, %v]\n", kv.me, kv.store, key, reply)
 		} else {
 			reply.Err = rpc.ErrNoKey
 		}
@@ -68,7 +66,6 @@ func (kv *KVServer) DoOp(req any) any {
 			currVersion := valVersion.Version
 			if version == currVersion {
 				kv.store[key] = KVServerValue{Value: newVal, Version: currVersion + 1}
-				// log.Printf("server %v updates kvstore with [k,v] [%v, %v]\n", kv.me, key, KVServerValue{Value: newVal, Version: currVersion + 1})
 				reply.Err = rpc.OK
 			} else {
 				reply.Err = rpc.ErrVersion
@@ -105,7 +102,6 @@ func (kv *KVServer) Restore(data []byte) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	kv.store = store 
-	// log.Printf("server %v's store is %v\n", kv.me, kv.store)
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -163,8 +159,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(rsm.Op{})
-	// labgob.Register(rpc.PutArgs{})
-	// labgob.Register(rpc.GetArgs{})
 	labgob.Register(Req{})
 
 	kv := &KVServer{me: me}
@@ -173,5 +167,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
+	// Testcase potential issue or an undiscovered bug?
+	// For test TestSnapshotRPC4C, there might be low chance that we replicate logs on majority of servers 
+	// but timeout before commit, in this case the test will stuck and we need a no-op command to commit the 
+	// the past log
 	return []tester.IService{kv, kv.rsm.Raft()}
 }

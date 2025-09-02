@@ -2,7 +2,6 @@ package rsm
 
 import (
 	"bytes"
-	"log"
 	"sync"
 	"time"
 
@@ -90,7 +89,6 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if persister.SnapshotSize() > 0 {
 		snapshotData := persister.ReadSnapshot()
 		snapshotWithIndex := rsm.decodeSnapshot(snapshotData)
-		// log.Printf("server %v restores snapshot at index %v with size %v and current state size is %v\n", rsm.me, snapshotWithIndex.LastIncludedIndex, persister.SnapshotSize(), persister.RaftStateSize())
 		rsm.sm.Restore(snapshotWithIndex.Snapshot)
 		rsm.appliedIndex = snapshotWithIndex.LastIncludedIndex
 		rsm.snapshotIndex = snapshotWithIndex.LastIncludedIndex
@@ -122,7 +120,7 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// your code here
 	op := Op{Id: uuid.NewString(), Req: req}
 
-	_, _, isLeader := rsm.rf.Start(op)
+	_, term, isLeader := rsm.rf.Start(op)
 
 	if !isLeader {
 		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
@@ -142,9 +140,10 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 				return rpc.OK, result
 			}
 			rsm.mu.Unlock()
-			// detect if the leadership is changed
-			_, isLeader := rsm.rf.GetState()
-			if !isLeader {
+			// detect if the leadership is changed; cant use the isLeader because if the server is again becoming the leader with a larger term
+			// and there is no new commits, the old one will be stuck here for a long time
+			currTerm, _ := rsm.rf.GetState()
+			if currTerm != term {
 				return rpc.ErrWrongLeader, nil
 			}
 		}
@@ -158,25 +157,12 @@ func (rsm *RSM) reader() {
 			command := m.Command.(Op)
 			rsm.mu.Lock()
 			result := rsm.sm.DoOp(command.Req)
-			// increase index
-			if m.CommandIndex < rsm.appliedIndex {
-				log.Panicf("commitIndex %v is smaller than applied index %v\n", m.CommandIndex, rsm.appliedIndex)
-			}
 			rsm.appliedIndex = m.CommandIndex
-			// log.Printf("server %v updates appliedIndex at %v, raft state size %v\n", rsm.me, rsm.appliedIndex, rsm.rf.PersistBytes())
 			rsm.results[command.Id] = result
 			rsm.mu.Unlock()
 		} else if m.SnapshotValid {
-			// log.Printf("server %v installs snapshot at index %v, term %v\n", rsm.me, m.SnapshotIndex, m.SnapshotTerm)
 			snapshotWithIndex := rsm.decodeSnapshot(m.Snapshot)
-			if snapshotWithIndex.LastIncludedIndex != m.SnapshotIndex {
-				log.Panicf("snapshot index in storage %v is different from the message snapshot index %v\n", snapshotWithIndex.LastIncludedIndex, m.SnapshotIndex)
-			}
 			rsm.mu.Lock()
-			// message might be delayed, so the snapshot in the message is earlier than the one rsm created, in this case skip the snapshot
-			if rsm.appliedIndex >= m.SnapshotIndex {
-				log.Panicf("rsm last snapshot index %v is larger than message snapshot index %v\n", rsm.snapshotIndex, m.SnapshotIndex)
-			}
 			rsm.sm.Restore(snapshotWithIndex.Snapshot)
 			rsm.appliedIndex = m.SnapshotIndex
 			rsm.mu.Unlock()
@@ -197,7 +183,6 @@ func (rsm *RSM) makeSnapshot() {
 				snapshot := rsm.sm.Snapshot()
 				snapshotWithIndex := rsm.encodeSnapshot(snapshot)
 				rsm.rf.Snapshot(rsm.appliedIndex, snapshotWithIndex)
-				// log.Printf("server %v creating snapshot at appliedIndex %v with afterwards raft state size %v\n", rsm.me, rsm.appliedIndex, rsm.rf.PersistBytes())
 				rsm.snapshotIndex = rsm.appliedIndex
 			}
 			rsm.mu.Unlock()
