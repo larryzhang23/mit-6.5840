@@ -63,6 +63,8 @@ type Raft struct {
 	heartbeatCh chan struct{}
 	// A channel to inform short time running goroutine the server is closed
 	stopCh chan struct{}
+	// synchronization signal, this is avoiding the applyDaemon running when the raft is shutdown; The tester relis on us to clean up them
+	wg sync.WaitGroup 
 }
 
 type State int 
@@ -128,10 +130,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		return 
 	}
 	logItem := rf.logs[idx]
-	// for debug
-	if logItem.Index != index {
-		log.Fatalf("log index %v different from snapshot index %v\n", logItem.Index, index)
-	}
 	rf.snapshot = &SnapshotBody{Data: snapshot, LastIncludedIndex: index, LastIncludedTerm: logItem.Term}
 
 	// shrink the rf.logs, the last item in snapshot now becomes the sentinel
@@ -139,7 +137,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// update termLastEntry
 	rf.updateTermLastEntry()
 	rf.persist()
-	DPrintf("[goroutineId | %v]: server %v (state %v) create snapshot until index %v; shrink log to length %v\n", getGID(), rf.me, rf.state, index, len(rf.logs))
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -203,6 +200,8 @@ func (rf *Raft) Kill() {
 	if atomic.SwapInt32(&rf.dead, 1) == 0 {
         close(rf.stopCh)
 		// don't close applyCh here
+		// wait until applyDaemon is returned
+		rf.wg.Wait()
     }
 }
 
@@ -248,9 +247,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start election timeout goroutine
 	go rf.heartbeatDaemon()
 	// start applydaemon to apply logs
+	rf.wg.Add(1)
 	go rf.applyDaemon()
-	DPrintf("[goroutineId | %v]: server %v starts finish\n", getGID(), rf.me)
-
 	return rf
 }
 
@@ -362,11 +360,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitedIdx = lastIncludedIndex
 		// update last applied
 		rf.lastApplied = lastIncludedIndex
-
-		DPrintf("[goroutineId | %v]: server %v restarts with term %v and votefor %v; loads snapshot with index %v and term %v, size %v\n", getGID(), rf.me, rf.currentTerm, rf.voteFor, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm, len(snapshot))
-		// DPrintf("server %v's snapshot data: %v", rf.me, rf.snapshot.Data)
-	} else {
-		DPrintf("[goroutineId | %v]: server %v no snapshots(snapshot size %v)\n", getGID(), rf.me, rf.persister.SnapshotSize())
 	}
 }
 
@@ -483,7 +476,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		updatePersist := rf.updateTermAndStateFromLargerTerm(reply.Term)
 		if rf.state == Candidate {
 			if reply.VoteGranted {
-				DPrintf("[goroutineId | %v]: Candidate %v receives vote from server %v\n", getGID(), rf.me, server)
 				rf.votesCount++
 				majority := len(rf.peers) / 2 + 1
 				if rf.votesCount + 1 >= majority {
@@ -511,13 +503,11 @@ func (rf *Raft) leaderInit() {
 	}
 	// start heartbeats goroutine
 	go rf.leaderDaemon()
-	DPrintf("[goroutineId | %v]: %v becomes a leader\n", getGID(), rf.me)
 }
 
 func (rf *Raft) handleLeaderSelection() {
 	// start leader electtion 
 	// when we call this function, default is the lock is acquired
-	DPrintf("[goroutineId | %v]: %v start a new term(%v) from state %v to be a candidate\n", getGID(), rf.me, rf.currentTerm + 1, rf.state)
 	rf.currentTerm++
 	rf.voteFor = rf.me 
 	rf.state = Candidate
@@ -597,12 +587,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	idx := rf.indexToInd(args.PrevLogIdx)
 	// handle the out-of-order and delayed request
 	if idx < 0 {
-		DPrintf("follower %v receives a request that compare packets before snapshots; current snapshot lastincludedindex %v, args.PrevLogIdx %v\n", rf.me, rf.snapshot.LastIncludedIndex, args.PrevLogIdx)
 		// trim the args.Entries to start after rf.snapshot.
-		// debug
-		if -idx - 1 < len(args.Entries) && args.Entries[-idx - 1].Term != rf.snapshot.LastIncludedTerm {
-			log.Fatalf("Leader %v packet at index %v has term %v different from snapshot lastincludedindex %v's term %v\n", args.LeaderId, args.Entries[-idx-1].Index, args.Entries[-idx-1].Term, rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm)
-		}
 		args.PrevLogIdx = rf.snapshot.LastIncludedIndex
 		args.PrevLogTerm = rf.snapshot.LastIncludedTerm
 		trimIdx := min(-idx, len(args.Entries))
@@ -610,59 +595,57 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		idx = 0
 	}
 
-	// set XLen to the length of current log so that the leader knows
-	reply.XLen = lastLog.Index + 1
-	if lastLog.Index >= args.PrevLogIdx {
-		prevLog := rf.logs[idx]
-		if prevLog.Term == args.PrevLogTerm {
-			// set reply to be successful
-			reply.Success = true 
-			// append new entries
-			if len(args.Entries) > 0 {
-				// add new logs and update last entry of terms if necessary
-				// shouldn't trim the logs directly in case it is an older request from the same leader but with shorter entries
-				// rf.shrinkLog("left", idx + 1)
-				i := 0
-				for ; i + idx + 1 < len(rf.logs) && i < len(args.Entries); i++ {
-					if rf.logs[i + idx + 1].Term == args.Entries[i].Term {
-						continue 
-					} 
-					rf.shrinkLog("left", i + idx + 1)
-					break
-				}
-				if i < len(args.Entries) {
-					rf.logs = append(rf.logs, args.Entries[i:]...)
-					lastLog = &rf.logs[len(rf.logs) - 1]
-					rf.updateTermLastEntry()
-					updatePersist = true 
-				}
-			}
-			// update commitedIdx
-			if args.LeaderCommit > rf.commitedIdx && lastLog.Index > rf.commitedIdx {
-				lastCommitedIdx := rf.commitedIdx
-				rf.commitedIdx = min(lastLog.Index, args.LeaderCommit)
-				DPrintf("Follower %v updates commitedIdx from %v to %v at term %v\n", rf.me, lastCommitedIdx, rf.commitedIdx, rf.currentTerm)
-			}
-		} else {
-			term := prevLog.Term
-			reply.XTerm = term 
-			lastTerm := 0
-			// get the first index of the conflict term so that leader can use it to skip the current term
-			for t := range rf.termLastEntry {
-				if t < term && t > lastTerm {
-					lastTerm = t 
-				}
-			}
-			reply.XIndex = rf.logs[rf.termLastEntry[lastTerm]].Index + 1
-			// DPrintf("[goroutineId | %v]: server %v rejects with lastTerm %v, and logs %v\n", getGID(), rf.me, lastTerm, rf.logs)
+	// follower too short to contain PrevLogIdx → tell leader our length (index-space)
+	if lastLog.Index < args.PrevLogIdx {
+		reply.XLen = lastLog.Index + 1
+		if updatePersist { 
+			rf.persist() 
 		}
+		return
+	}
+	
+	prevLog := rf.logs[idx]
+	if prevLog.Term == args.PrevLogTerm {
+		// set reply to be successful
+		reply.Success = true 
+		// append new entries
+		if len(args.Entries) > 0 {
+			// add new logs and update last entry of terms if necessary
+			// shouldn't trim the logs directly in case it is an older request from the same leader but with shorter entries
+			// rf.shrinkLog("left", idx + 1)
+			i := 0
+			for ; i + idx + 1 < len(rf.logs) && i < len(args.Entries); i++ {
+				if rf.logs[i + idx + 1].Term == args.Entries[i].Term && rf.logs[i + idx + 1].Index == args.Entries[i].Index {
+					continue 
+				} 
+				rf.shrinkLog("left", i + idx + 1)
+				break
+			}
+			if i < len(args.Entries) {
+				rf.logs = append(rf.logs, args.Entries[i:]...)
+				lastLog = &rf.logs[len(rf.logs) - 1]
+				rf.updateTermLastEntry()
+				updatePersist = true 
+			}
+		}
+		// update commitedIdx
+		if args.LeaderCommit > rf.commitedIdx && lastLog.Index > rf.commitedIdx {
+			rf.commitedIdx = min(lastLog.Index, args.LeaderCommit)
+		}
+	} else {
+		term := prevLog.Term
+		reply.XTerm = term 
+		// get the first index of the conflict term so that leader can use it to skip the current term
+		lastTerm := 0
+		for t := range rf.termLastEntry {
+			if t < term && t > lastTerm {
+				lastTerm = t 
+			}
+		}
+		reply.XIndex = rf.logs[rf.termLastEntry[lastTerm]].Index + 1
 	}
 	if updatePersist {
 		rf.persist()
-	}
-	// debug
-	if !reply.Success {
-		DPrintf("[goroutineId | %v]: AppendEntries Failed from Leader %v (term %v) of previndex %v, prevterm %v; Follower %v returns XLen %v, XTerm %v, XIndex %v; follower last log index %v\n", getGID(), args.LeaderId, args.Term, args.PrevLogIdx, args.PrevLogTerm, rf.me, reply.XLen, reply.XTerm, reply.XIndex, rf.getLastLog().Index)
 	}
 }
 
@@ -688,20 +671,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 					rf.nextIdx[server] = nextIdx
 				}
 
-				// for debug
-				var lastEntry Log
-				if len(args.Entries) > 0 {
-					lastEntry = args.Entries[len(args.Entries) - 1]
-				} else {
-					lastEntry = *rf.getLastLog()
+				// first check if matchIdx is still in the logs, if it is not, it means it's been snapshoted and we can just return
+				idx := rf.indexToInd(matchIdx)
+				if idx < 0 {
+					return ok
 				}
-				// DPrintf("[goroutineId | %v]: Request successful update follower %v nextIdx to be %v and last entry: %v; leader logs: %v\n", getGID(), server, matchIdx + 1, lastEntry, rf.logs)
-				DPrintf("[goroutineId | %v]: Request successful update follower %v nextIdx to be %v and last entry: %v; leader logs length: %v\n", getGID(), server, matchIdx + 1, lastEntry, len(rf.logs))
+				
 				// update the commitIndex if the log is in current term
-				if rf.commitedIdx < matchIdx && rf.logs[rf.indexToInd(matchIdx)].Term == rf.currentTerm {
+				if rf.commitedIdx < matchIdx && rf.logs[idx].Term == rf.currentTerm {
 					replicateCnt := 0
 					majority := len(rf.peers) / 2 + 1
-					for i := range rf.matchIdx {
+					for i := range rf.peers {
 						if i == rf.me {
 							continue
 						}
@@ -715,9 +695,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 					}
 					// increate commitedIdx
 					if replicateCnt + 1 >= majority {
-						lastCommited := rf.commitedIdx
 						rf.commitedIdx = matchIdx
-						DPrintf("Leader %v updates commitedIdx from %v to %v at term %v\n", rf.me, lastCommited, rf.commitedIdx, rf.currentTerm)
 					}
 				}
 			} else {
@@ -728,11 +706,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 						rf.nextIdx[server] = reply.XIndex
 					}
 				} else if reply.XLen > 0 {
-					DPrintf("[goroutineId | %v]: Before update: nextIdx[%d]=%d, reply.XLen=%d", getGID(), server, rf.nextIdx[server], reply.XLen)
 					rf.nextIdx[server] = reply.XLen
-				} else {
-					// network partision or conjection leading to late response
-					DPrintf("[goroutineId | %v]: Follower %v(term %v)'s XLen %v, XTerm %v XIndex %v rejects leader request because of term. Don't update anything and just retry", getGID(), server, reply.Term, reply.XLen, reply.XTerm, reply.XIndex)
 				}
 			}
 		}
@@ -756,7 +730,6 @@ func (rf *Raft) handleAppendEntries() {
 		if i == rf.me {
 			continue
 		}
-		// DPrintf("for follower %v, nextIdx is %v\n", i, rf.nextIdx[i])
 		// Decide to send InstallSnapshot RPC or AppendEntries RPC
 		previdx := rf.indexToInd(rf.nextIdx[i] - 1)
 		if previdx < 0 {
@@ -842,7 +815,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return 
 	}
 
-	DPrintf("Follower %v receive a snapshot with includedIndex %v from leader %v\n", rf.me, args.LastIncludedIndex, args.LeaderId)
 	lastLog := rf.getLastLog()
 
 	// all other cases, it will install snapshot and trim the logs
@@ -850,7 +822,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	idx := rf.indexToInd(args.LastIncludedIndex)
 	rf.snapshot = &SnapshotBody{Data: args.Data, LastIncludedIndex: args.LastIncludedIndex, LastIncludedTerm: args.LastIncludedTerm}
 	updatePersist = true 
-
 	// second case, the snapshot is ahead of logs; remove the whole rf.logs (here we add a sentinel log)
 	if args.LastIncludedIndex > lastLog.Index {
 		rf.logs = []Log{{Term: args.LastIncludedTerm, Index: args.LastIncludedIndex}}
@@ -917,7 +888,6 @@ func (rf *Raft) heartbeatDaemon() {
 		case <- timer.C:
 			rf.mu.Lock()
 			if rf.state != Leader {
-				// DPrintf("%v times out at term %v\n", rf.me, rf.currentTerm)
 				rf.handleLeaderSelection()
 			}
 			rf.mu.Unlock()
@@ -929,6 +899,7 @@ func (rf *Raft) heartbeatDaemon() {
 }
 
 func (rf *Raft) leaderDaemon() {
+	rf.handleAppendEntries()
 	ms := 100
 	for {
 		select {
@@ -941,6 +912,8 @@ func (rf *Raft) leaderDaemon() {
 }
 
 func (rf *Raft) applyDaemon() {
+	// wg is to avoid the zombie applyDaemon sends to the tester; so rf.Kill() wait until it is returned
+	defer rf.wg.Done()
 	defer close(rf.applyCh)
 	ms := time.Duration(10) * time.Millisecond
 	for {
@@ -972,11 +945,21 @@ func (rf *Raft) applyDaemon() {
 			}
 			rf.mu.Unlock()
 			if len(snapshot) > 0 {
-				rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}
+				select {
+				case <- rf.stopCh:
+					return 
+				default:
+					rf.applyCh <- raftapi.ApplyMsg{SnapshotValid: true, Snapshot: snapshot, SnapshotTerm: lastIncludedTerm, SnapshotIndex: lastIncludedIndex}
+				}
 				rf.lastApplied = lastIncludedIndex
 			}
 			for _, logItem := range copyLogs {
-				rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logItem.Command, CommandIndex: logItem.Index}
+				select {
+				case <- rf.stopCh:
+					return 
+				default:
+					rf.applyCh <- raftapi.ApplyMsg{CommandValid: true, Command: logItem.Command, CommandIndex: logItem.Index}
+				}
 				rf.lastApplied = logItem.Index
 			}
 		}
@@ -1017,7 +1000,6 @@ func (rf *Raft) indexToInd(logIndex int) int {
 	if rf.snapshot != nil {
 		snapshotIndex := rf.snapshot.LastIncludedIndex
 		// we keep a sentinel log in the index 0 of the rf.logs which is either (term 0) or the last entry of the snapshot
-		// DPrintf("server %v trigger here and the value is %v(%v - %v)\n", rf.me, logIndex - snapshotIndex, logIndex, snapshotIndex)
 		return logIndex - snapshotIndex
 	} else {
 		return logIndex
