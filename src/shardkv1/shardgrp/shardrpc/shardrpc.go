@@ -5,6 +5,12 @@ import (
 	"6.5840/shardkv1/shardcfg"
 )
 
+
+const (
+	ErrOutdatedCfg = "ErrOutdatedConfig"
+	ErrNoResp = "ErrNoResponse"
+)
+
 type FreezeShardArgs struct {
 	Shard shardcfg.Tshid
 	Num   shardcfg.Tnum
