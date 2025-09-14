@@ -18,7 +18,6 @@ import (
 	"6.5840/shardkv1/shardctrler"
 	"6.5840/shardkv1/shardgrp"
 	"6.5840/shardkv1/shardgrp/shardrpc"
-	"6.5840/shardkv1/utils"
 	"6.5840/tester1"
 )
 
@@ -56,7 +55,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			log.Fatal("shardId is not store in any group servers\n")
 		}
 		clerk := shardgrp.MakeClerk(ck.clnt, servers)
-		utils.DPrintf("cfg is %v for get req (key %v, shardId %v), servers %v\n", cfg, servers, shardId, servers)
+		//utils.DPrintf("cfg is %v for get req (key %v, shardId %v), servers %v\n", cfg, servers, shardId, servers)
 		value, version, err := clerk.Get(key)
 		if err == rpc.ErrWrongGroup || err == shardrpc.ErrNoResp {
 			time.Sleep(ms)
@@ -80,7 +79,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 			log.Fatal("shardId is not store in any group servers\n")
 		}
 		clerk := shardgrp.MakeClerk(ck.clnt, servers)
-		utils.DPrintf("cfg is %v for put req (key %v, shard %v), servers %v\n", cfg, key, shardId, servers)
+		//utils.DPrintf("cfg is %v for put req (key %v, shard %v), servers %v\n", cfg, key, shardId, servers)
 		err := clerk.Put(key, value, version)
 		if err == rpc.ErrWrongGroup || err == shardrpc.ErrNoResp {
 			if err == shardrpc.ErrNoResp {

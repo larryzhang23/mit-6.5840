@@ -8,7 +8,6 @@ import (
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
 	"6.5840/tester1"
-	//"6.5840/shardkv1/utils"
 )
 
 type Clerk struct {
@@ -110,6 +109,7 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 			return reply.State, reply.Err
 		}
 	}
+	retry := 0
 	for reply.Err == "" || reply.Err == rpc.ErrWrongLeader {
 		for idx, server := range ck.servers {
 			reply := shardrpc.FreezeShardReply{}
@@ -120,6 +120,11 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 				ck.mu.Unlock()
 				return reply.State, reply.Err
 			}
+		}
+		retry++
+		if retry == 10 {
+			reply.Err = shardrpc.ErrNoResp
+			return reply.State, reply.Err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -141,6 +146,7 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 			return reply.Err
 		}
 	}
+	retry := 0
 	for reply.Err == "" || reply.Err == rpc.ErrWrongLeader {
 		for idx, server := range ck.servers {
 			reply := shardrpc.InstallShardReply{}
@@ -151,6 +157,11 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 				ck.mu.Unlock()
 				return reply.Err
 			}
+		}
+		retry++
+		if retry == 10 {
+			reply.Err = shardrpc.ErrNoResp
+			return reply.Err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -171,6 +182,7 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 			return reply.Err
 		}
 	}
+	retry := 0
 	for reply.Err == "" || reply.Err == rpc.ErrWrongLeader {
 		for idx, server := range ck.servers {
 			reply := shardrpc.DeleteShardReply{}
@@ -181,6 +193,11 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 				ck.mu.Unlock()
 				return reply.Err
 			}
+		}
+		retry++
+		if retry == 10 {
+			reply.Err = shardrpc.ErrNoResp
+			return reply.Err
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

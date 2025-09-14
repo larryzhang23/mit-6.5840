@@ -8,6 +8,7 @@ import (
 
 const (
 	ErrOutdatedCfg = "ErrOutdatedConfig"
+	ErrAlreadyExec = "ErrAlreadyExec"
 	ErrNoResp = "ErrNoResponse"
 )
 

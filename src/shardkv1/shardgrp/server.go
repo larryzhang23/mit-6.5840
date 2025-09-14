@@ -2,7 +2,6 @@ package shardgrp
 
 import (
 	"bytes"
-	//"sort"
 	"sync"
 	"sync/atomic"
 
@@ -13,7 +12,6 @@ import (
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp/shardrpc"
 	"6.5840/tester1"
-	"6.5840/shardkv1/utils"
 )
 
 
@@ -99,17 +97,17 @@ func (kv *KVServer) DoOp(req any) any {
 		// check if it is a valid freeze shard request
 		shardInfo, ok := kv.shard[r.Shard]
 		if !ok || shardInfo.Num > r.Num {
-			// tmp := make([]int, 0, len(kv.shard))
-			// for k := range kv.shard {
-			// 	tmp = append(tmp, int(k))
-			// }
-			// sort.Ints(tmp)
-			// utils.DPrintf("reject freeze shard from req %v by ok %v, shardInfo num %v, containing shardIds %v\n", r, ok, shardInfo.Num, tmp)
 			reply.Err = shardrpc.ErrOutdatedCfg
 			return reply
 		}
-	
-		kv.shard[r.Shard] = ShardInfo{Num: shardInfo.Num, Keys: shardInfo.Keys, Frozen: true}
+		
+		if shardInfo.Frozen {
+			reply.Err = shardrpc.ErrAlreadyExec
+		} else {
+			reply.Err = rpc.OK
+			kv.shard[r.Shard] = ShardInfo{Num: shardInfo.Num, Keys: shardInfo.Keys, Frozen: true}
+		}
+		
 		shardState := make(map[string]KVServerValue)
 		for k := range shardInfo.Keys {
 			shardState[k] = kv.store[k]
@@ -121,7 +119,6 @@ func (kv *KVServer) DoOp(req any) any {
 			reply.State = w.Bytes()
 		}
 		
-		reply.Err = rpc.OK
 		reply.Num = shardInfo.Num
 		return reply
 	} else if r, ok := req.(shardrpc.InstallShardArgs); ok {
@@ -129,13 +126,11 @@ func (kv *KVServer) DoOp(req any) any {
 		// check if it is a valid freeze shard request
 		shardInfo, ok := kv.shard[r.Shard]
 		if ok && shardInfo.Num > r.Num {
-			// tmp := make([]int, 0, len(kv.shard))
-			// for k := range kv.shard {
-			// 	tmp = append(tmp, int(k))
-			// }
-			// sort.Ints(tmp)
-			// utils.DPrintf("reject install shard from req(shard %v, num %v) by ok %v, shardInfo num %v, containing shardIds %v\n", r.Shard, r.Num, ok, shardInfo.Num, tmp)
 			reply.Err = shardrpc.ErrOutdatedCfg
+			return reply
+		}
+		if ok && shardInfo.Num == r.Num {
+			reply.Err = shardrpc.ErrAlreadyExec
 			return reply
 		}
 	
@@ -151,9 +146,6 @@ func (kv *KVServer) DoOp(req any) any {
 			}
 		}
 		kv.shard[r.Shard] = ShardInfo{Keys: keys, Num: r.Num}
-		// if term, isLeader := kv.rsm.Raft().GetState(); isLeader {
-		// 	utils.DPrintf("Term: %v, install shard %v on gid %v server %v; shard: %v\n", term, r.Shard, kv.gid, kv.me, kv.shard)
-		// }
 		reply.Err = rpc.OK
 		return reply
 	} else if r, ok := req.(shardrpc.DeleteShardArgs); ok {
@@ -161,12 +153,6 @@ func (kv *KVServer) DoOp(req any) any {
 		// check if it is a valid freeze shard request
 		shardInfo, ok := kv.shard[r.Shard]
 		if !ok || shardInfo.Num > r.Num {
-			// tmp := make([]int, 0, len(kv.shard))
-			// for k := range kv.shard {
-			// 	tmp = append(tmp, int(k))
-			// }
-			// sort.Ints(tmp)
-			// utils.DPrintf("reject delete shard from req %v by ok %v, shardInfo num %v, containing shardIds %v\n", r, ok, shardInfo.Num, tmp)
 			reply.Err = shardrpc.ErrOutdatedCfg
 			return reply
 		}
@@ -174,9 +160,6 @@ func (kv *KVServer) DoOp(req any) any {
 		for k := range shardInfo.Keys {
 			delete(kv.store, k)
 		}
-		// if term, isLeader := kv.rsm.Raft().GetState(); isLeader { 
-		// 	utils.DPrintf("Term: %v, delete shard %v on gid %v server %v\n", term, r.Shard, kv.gid, kv.me)
-		// }
 		reply.Err = rpc.OK
 		return reply
 	}
@@ -288,7 +271,6 @@ func (kv *KVServer) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	// Your code here, if desired.
-	utils.DPrintf("gid %v, server id %v is killed\n", kv.gid, kv.me)
 }
 
 func (kv *KVServer) killed() bool {

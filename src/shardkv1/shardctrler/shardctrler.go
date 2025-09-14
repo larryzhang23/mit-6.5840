@@ -5,13 +5,15 @@ package shardctrler
 //
 
 import (
-	"log"
+	"math/rand"
 	"sync"
 
 	"6.5840/kvsrv1"
+	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp"
+	"6.5840/shardkv1/shardgrp/shardrpc"
 	"6.5840/shardkv1/utils"
 	"6.5840/tester1"
 )
@@ -25,6 +27,9 @@ type ShardCtrler struct {
 
 	// Your data here.
 	cfgKey string
+	cfgKeyNext string
+	// for debug
+	id int
 }
 
 // Make a ShardCltler, which stores its state in a kvsrv.
@@ -34,13 +39,35 @@ func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
 	sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)
 	// Your code here.
 	sck.cfgKey = "cfg"
+	sck.cfgKeyNext = "cfgNew"
+	sck.id = rand.Int()
 	return sck
+}
+
+// for debug
+func (sck *ShardCtrler) Id() int {
+	return sck.id
 }
 
 // The tester calls InitController() before starting a new
 // controller. In part A, this method doesn't need to do anything. In
 // B and C, this method implements recovery.
 func (sck *ShardCtrler) InitController() {
+	cfgStr, cfgVersionCurr, _ := sck.IKVClerk.Get(sck.cfgKey)
+	cfgStrNewInPast, _, _ := sck.IKVClerk.Get(sck.cfgKeyNext)
+	cfgCurr := shardcfg.FromString(cfgStr)
+	cfgNewInPast := shardcfg.FromString(cfgStrNewInPast)
+
+	if cfgNewInPast.Num == cfgCurr.Num {
+		return 
+	}
+
+	// rerun the configuation update
+	sck.configMigrationHelper(cfgCurr, cfgNewInPast)
+
+	// change current cfg to the new version
+	sck.IKVClerk.Put(sck.cfgKey, cfgStrNewInPast, cfgVersionCurr)
+
 }
 
 // Called once by the tester to supply the first configuration.  You
@@ -51,8 +78,8 @@ func (sck *ShardCtrler) InitController() {
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 	// Your code here
 	cfgStr := cfg.String()
-	utils.DPrintf("init config: %v\n", cfgStr)
 	sck.IKVClerk.Put(sck.cfgKey, cfgStr, 0)
+	sck.IKVClerk.Put(sck.cfgKeyNext, cfgStr, 0)
 }
 
 // Called by the tester to ask the controller to change the
@@ -61,14 +88,33 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// Your code here.
-	utils.DPrintf("new config: %v\n", new)
-	cfgStr, cfgVersion, _ := sck.IKVClerk.Get(sck.cfgKey)
+	cfgStr, cfgVersionCurr, _ := sck.IKVClerk.Get(sck.cfgKey)
 	old := shardcfg.FromString(cfgStr)
+	newCfgStr := new.String()
 
+	// before changing config, put the next config in storage first
+	cfgStrNext, cfgVersionNew, _ := sck.IKVClerk.Get(sck.cfgKeyNext)
+
+	// check if other controller already put the next config, if so, return directly
+	cfgNext := shardcfg.FromString(cfgStrNext)
+	if old.Num >= new.Num || cfgNext.Num >= new.Num {
+		return 
+	}
+	// if put is failed, return directly
+	err := sck.IKVClerk.Put(sck.cfgKeyNext, newCfgStr, cfgVersionNew)
+	if err != rpc.OK {
+		if err != rpc.ErrMaybe {
+			return 
+		} else if c, v, _ := sck.IKVClerk.Get(sck.cfgKeyNext); c != newCfgStr || cfgVersionNew + 1 != v {
+			return 
+		} 
+	}
+
+	// update grps and shards
 	sck.configMigrationHelper(old, new)
 
-	newCfgStr := new.String()
-	sck.IKVClerk.Put(sck.cfgKey, newCfgStr, cfgVersion)
+	// change current cfg to the new version
+	sck.IKVClerk.Put(sck.cfgKey, newCfgStr, cfgVersionCurr)	
 }
 
 
@@ -88,22 +134,47 @@ func (sck *ShardCtrler) configMigrationHelper(old, new *shardcfg.ShardConfig) {
 		wg.Add(1)
 		go func(oldShardId, newShardId tester.Tgid) {
 			defer wg.Done()
-			newGrp, newOk := new.Groups[newShardId]
-			oldGrp, oldOk := old.Groups[oldShardId]
-			if !newOk || !oldOk {
-				log.Fatalf("new shardgrp or old shardgrp does not exists (newOk %v, oldOk %v)\n", newOk, oldOk)
-			}
+			newGrp, _ := new.Groups[newShardId]
+			oldGrp, _ := old.Groups[oldShardId]
+			
 			// install new shards or move shards
 			// first freeze the shard on the old group if it exists
 			oldClerk := shardgrp.MakeClerk(sck.clnt, oldGrp)
-			shardState, _ := oldClerk.FreezeShard(shardcfg.Tshid(shardId), old.Num)
+			shardState, err := oldClerk.FreezeShard(shardcfg.Tshid(shardId), old.Num)
+			// handle the case where the cluster holding the shard is unreachable
+			for err == shardrpc.ErrNoResp {
+				cfgCurr := sck.Query()
+				if cfgCurr.Num >= new.Num {
+					return 
+				}
+				shardState, err = oldClerk.FreezeShard(shardcfg.Tshid(shardId), old.Num)
+			}
+			// when the freezeshard rpc is outdated, no need to keep going
+			if err == shardrpc.ErrOutdatedCfg {
+				utils.DPrintf("Outdated freezeshard for shard %v and config num %v, return is %v\n", shardId, old.Num, err)
+				return 
+			}
 
 			// install the shard state on the new group 
 			newClerk := shardgrp.MakeClerk(sck.clnt, newGrp)
-			newClerk.InstallShard(shardcfg.Tshid(shardId), shardState, new.Num)
+			err = newClerk.InstallShard(shardcfg.Tshid(shardId), shardState, new.Num)
+			for err == shardrpc.ErrNoResp {
+				cfgCurr := sck.Query()
+				if cfgCurr.Num >= new.Num {
+					return 
+				}
+				err = newClerk.InstallShard(shardcfg.Tshid(shardId), shardState, new.Num)
+			}
 
 			// delete the shard on the old group if it exists
-			oldClerk.DeleteShard(shardcfg.Tshid(shardId), old.Num)
+			err = oldClerk.DeleteShard(shardcfg.Tshid(shardId), old.Num)
+			for err == shardrpc.ErrNoResp {
+				cfgCurr := sck.Query()
+				if cfgCurr.Num >= new.Num {
+					return 
+				}
+				err = oldClerk.DeleteShard(shardcfg.Tshid(shardId), old.Num)
+			}
 				
 		}(old.Shards[shardId], new.Shards[shardId])
 	}
