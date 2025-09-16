@@ -67,7 +67,6 @@ func (sck *ShardCtrler) InitController() {
 
 	// change current cfg to the new version
 	sck.IKVClerk.Put(sck.cfgKey, cfgStrNewInPast, cfgVersionCurr)
-
 }
 
 // Called once by the tester to supply the first configuration.  You
@@ -88,33 +87,34 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// Your code here.
-	cfgStr, cfgVersionCurr, _ := sck.IKVClerk.Get(sck.cfgKey)
-	old := shardcfg.FromString(cfgStr)
 	newCfgStr := new.String()
-
 	// before changing config, put the next config in storage first
 	cfgStrNext, cfgVersionNew, _ := sck.IKVClerk.Get(sck.cfgKeyNext)
-
 	// check if other controller already put the next config, if so, return directly
 	cfgNext := shardcfg.FromString(cfgStrNext)
-	if old.Num >= new.Num || cfgNext.Num >= new.Num {
+	if cfgNext.Num >= new.Num {
 		return 
 	}
 	// if put is failed, return directly
 	err := sck.IKVClerk.Put(sck.cfgKeyNext, newCfgStr, cfgVersionNew)
-	if err != rpc.OK {
-		if err != rpc.ErrMaybe {
-			return 
-		} else if c, v, _ := sck.IKVClerk.Get(sck.cfgKeyNext); c != newCfgStr || cfgVersionNew + 1 != v {
-			return 
-		} 
+	if err == rpc.ErrVersion {
+		return
 	}
+	// check if put is successful despite the network 
+	if err == rpc.ErrMaybe {
+		if c, v, _ := sck.IKVClerk.Get(sck.cfgKeyNext); c != newCfgStr || v != cfgVersionNew + 1 {
+			return 
+		}
+	}
+
+	cfgStr, cfgVersionCurr, _ := sck.IKVClerk.Get(sck.cfgKey)
+	old := shardcfg.FromString(cfgStr)
 
 	// update grps and shards
 	sck.configMigrationHelper(old, new)
 
 	// change current cfg to the new version
-	sck.IKVClerk.Put(sck.cfgKey, newCfgStr, cfgVersionCurr)	
+	sck.IKVClerk.Put(sck.cfgKey, newCfgStr, cfgVersionCurr)
 }
 
 
@@ -131,11 +131,13 @@ func (sck *ShardCtrler) configMigrationHelper(old, new *shardcfg.ShardConfig) {
 		if new.Shards[shardId] == old.Shards[shardId] {
 			continue
 		}
+		oldGrpId := old.Shards[shardId]
+		newGrpId := new.Shards[shardId]
 		wg.Add(1)
-		go func(oldShardId, newShardId tester.Tgid) {
+		go func(oldGrpId, newGrpId tester.Tgid) {
 			defer wg.Done()
-			newGrp, _ := new.Groups[newShardId]
-			oldGrp, _ := old.Groups[oldShardId]
+			newGrp := new.Groups[newGrpId]
+			oldGrp := old.Groups[oldGrpId]
 			
 			// install new shards or move shards
 			// first freeze the shard on the old group if it exists
@@ -151,7 +153,6 @@ func (sck *ShardCtrler) configMigrationHelper(old, new *shardcfg.ShardConfig) {
 			}
 			// when the freezeshard rpc is outdated, no need to keep going
 			if err == shardrpc.ErrOutdatedCfg {
-				utils.DPrintf("Outdated freezeshard for shard %v and config num %v, return is %v\n", shardId, old.Num, err)
 				return 
 			}
 
@@ -165,6 +166,11 @@ func (sck *ShardCtrler) configMigrationHelper(old, new *shardcfg.ShardConfig) {
 				}
 				err = newClerk.InstallShard(shardcfg.Tshid(shardId), shardState, new.Num)
 			}
+			// when the freezeshard rpc is outdated, no need to keep going
+			if err == shardrpc.ErrOutdatedCfg {
+				utils.DPrintf("%v: Outdated installshard for shard %v and config num %v\n", sck.id, shardId, old.Num)
+				return 
+			}
 
 			// delete the shard on the old group if it exists
 			err = oldClerk.DeleteShard(shardcfg.Tshid(shardId), old.Num)
@@ -175,8 +181,7 @@ func (sck *ShardCtrler) configMigrationHelper(old, new *shardcfg.ShardConfig) {
 				}
 				err = oldClerk.DeleteShard(shardcfg.Tshid(shardId), old.Num)
 			}
-				
-		}(old.Shards[shardId], new.Shards[shardId])
+		}(oldGrpId, newGrpId)
 	}
 	wg.Wait()
 }

@@ -73,7 +73,6 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		firstTimeSuccess = false 
 	}
 	
-	
 	for idx, server := range ck.servers {
 		reply = rpc.PutReply{}
 		ok := ck.clnt.Call(server, "KVServer.Put", &args, &reply)
@@ -110,7 +109,7 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 		}
 	}
 	retry := 0
-	for reply.Err == "" || reply.Err == rpc.ErrWrongLeader {
+	for {
 		for idx, server := range ck.servers {
 			reply := shardrpc.FreezeShardReply{}
 			ok := ck.clnt.Call(server, "KVServer.FreezeShard", &args, &reply)
@@ -128,8 +127,6 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	// never reach here
-	return reply.State, reply.Err
 }
 
 func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum) rpc.Err {
@@ -147,7 +144,7 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 		}
 	}
 	retry := 0
-	for reply.Err == "" || reply.Err == rpc.ErrWrongLeader {
+	for  {
 		for idx, server := range ck.servers {
 			reply := shardrpc.InstallShardReply{}
 			ok := ck.clnt.Call(server, "KVServer.InstallShard", &args, &reply)
@@ -165,7 +162,6 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return reply.Err
 }
 
 func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
@@ -183,7 +179,7 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		}
 	}
 	retry := 0
-	for reply.Err == "" || reply.Err == rpc.ErrWrongLeader {
+	for {
 		for idx, server := range ck.servers {
 			reply := shardrpc.DeleteShardReply{}
 			ok := ck.clnt.Call(server, "KVServer.DeleteShard", &args, &reply)
@@ -201,5 +197,4 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return reply.Err
 }
