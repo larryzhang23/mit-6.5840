@@ -1,4 +1,5 @@
 # Implementation of MIT 6.5840 course, spring 2025 version.
+* Here is the course [website](https://pdos.csail.mit.edu/6.824/)
 
 * **DO NOT LOOK AT IT** if you enroll the course. It is for someone who follows the course at home to refer to.
 
